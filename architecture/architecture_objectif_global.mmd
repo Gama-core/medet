@@ -1,0 +1,38 @@
+flowchart TB
+  IMG["Image radiologique<br/>tube digestif"]
+
+  subgraph ETAGE1["Etage 1 - embarque mobile"]
+    YOLO["YOLO nano / small<br/>localisation rapide"]
+  end
+
+  DEC{"Anomalie<br/>suspectee ?"}
+
+  subgraph ETAGE2["Etage 2 - cloud"]
+    EFF["EfficientNet<br/>transfer learning"]
+  end
+
+  subgraph CLASSES["4 classes detectees"]
+    C1["Normal"]
+    C2["Polype"]
+    C3["MICI"]
+    C4["Mauvaise_preparation"]
+  end
+
+  subgraph FUTUR["Evolution future"]
+    SWY["Hybride Swin / YOLO<br/>flux continu compresse"]
+    MOB["Application mobile"]
+    BACK["Backend"]
+  end
+
+  IMG --> YOLO --> DEC
+  DEC -->|non| C1
+  DEC -->|oui, image envoyee| EFF
+  EFF --> C2
+  EFF --> C3
+  EFF --> C4
+  EFF -.->|faux positif| C1
+
+  ETAGE1 -.-> FUTUR
+  ETAGE2 -.-> FUTUR
+  SWY --- MOB
+  MOB --- BACK
