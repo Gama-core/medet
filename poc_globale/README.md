@@ -71,7 +71,4 @@ Si les poids (`weights/`) sont absents, l'application bascule
 automatiquement en mode démo (prédictions simulées) avec un avertissement
 visuel — permettant de présenter l'interface sans modèle disponible.
 
-## Avertissement
 
-Ce POC est un outil de test interne. Il n'est pas destiné à un usage
-clinique et ne doit pas être utilisé pour une décision médicale réelle.
