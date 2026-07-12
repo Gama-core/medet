@@ -108,14 +108,14 @@ html, body, [class*="css"] {
 
 /* Barre latérale */
 [data-testid="stSidebar"] {
-    background: #0B2545;
-    border-right: 1px solid #0A2040;
+    background: #F7FAFC;
+    border-right: 1px solid #DFE6EB;
 }
 [data-testid="stSidebar"] * {
-    color: #E7EDF3 !important;
+    color: #14213D !important;
 }
 [data-testid="stSidebar"] hr {
-    border-color: rgba(255,255,255,0.15) !important;
+    border-color: rgba(11,37,69,0.12) !important;
 }
 
 /* En-tête produit */
@@ -184,14 +184,15 @@ p, li, label, span { color: #14213D; }
     gap: 8px;
 }
 [data-testid="stRadio"] label {
-    background: #FFFFFF;
-    border: 1px solid #DFE6EB;
+    background: #EAF4FC;
+    border: 1px solid #BEE0F5;
     border-radius: 10px;
     padding: 8px 14px;
     transition: all 0.15s ease;
 }
 [data-testid="stRadio"] label:hover {
     border-color: #0F8B8D;
+    background: #DCEEFB;
 }
 
 /* Boutons */
@@ -666,12 +667,12 @@ with st.sidebar:
     st.markdown(
         """
         <div style="display:flex;align-items:center;gap:10px;margin-bottom:4px;">
-            <div style="width:38px;height:38px;border-radius:10px;background:rgba(255,255,255,0.12);
-                        border:1px solid rgba(255,255,255,0.25);display:flex;align-items:center;
+            <div style="width:38px;height:38px;border-radius:10px;background:rgba(15,139,141,0.12);
+                        border:1px solid rgba(15,139,141,0.3);display:flex;align-items:center;
                         justify-content:center;font-size:20px;">🩺</div>
             <div>
-                <div style="font-weight:700;font-size:1.05rem;color:#fff;">medet</div>
-                <div style="font-size:0.72rem;color:rgba(255,255,255,0.65);">Aide au diagnostic endoscopique</div>
+                <div style="font-weight:700;font-size:1.05rem;color:#0B2545;">medet</div>
+                <div style="font-size:0.72rem;color:#5C6B7A;">Aide au diagnostic endoscopique</div>
             </div>
         </div>
         """,
@@ -732,7 +733,7 @@ st.divider()
 # --- Sélection du type d'entrée ---
 input_type = st.radio(
     "Type d'entrée",
-    ["🖼️ Image", "🎬 Vidéo", "📷 Webcam (live)", "🔗 Flux réseau (URL)"],
+    [" Image", " Vidéo", " Webcam (live)", "🔗 Flux réseau (URL)"],
     horizontal=True
 )
 
@@ -742,7 +743,7 @@ st.divider()
 # CAS 1 — IMAGE
 # ===================================================================
 
-if input_type == "🖼️ Image":
+if input_type == " Image":
     uploaded = st.file_uploader(
         "Dépose une image (endoscopie / coloscopie)",
         type=["jpg", "jpeg", "png"],
@@ -807,7 +808,7 @@ if input_type == "🖼️ Image":
 # CAS 2 — VIDÉO
 # ===================================================================
 
-elif input_type == "🎬 Vidéo":
+elif input_type == " Vidéo":
     uploaded_video = st.file_uploader(
         "Dépose une vidéo d'endoscopie (.avi, .mp4, .mov)",
         type=["avi", "mp4", "mov"],
@@ -996,7 +997,7 @@ elif input_type == "🎬 Vidéo":
 # CAS 3 — WEBCAM (live)
 # ===================================================================
 
-elif input_type == "📷 Webcam (live)":
+elif input_type == " Webcam (live)":
     st.caption(
         "Lit un flux caméra local en direct — sert à valider le pipeline "
         "en streaming avant le branchement sur un vrai flux endoscopique (RTSP)."
