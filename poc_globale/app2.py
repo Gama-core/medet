@@ -71,7 +71,7 @@ plt.rcParams.update({
 YOLO_WEIGHTS_PATH   = "weights/best.pt"
 EFFICIENTNET_PATH   = "weights/efficientnet_etage2.pt"
 CLASS_NAMES         = ["mauvaise_preparation", "mici", "normal", "polype"]
-YOLO_CONF           = 0.25
+YOLO_CONF           = 0.50
 FRAME_SKIP          = 5       # 1 frame analysée sur N
 MIN_SEGMENT_DURATION = 0.5   # secondes
 
