@@ -3,30 +3,24 @@ Backend FastAPI v3 — medet
 Pipeline hybride YOLO + EfficientNet avec classification fine des polypes
 =========================================================================
 
-Nouvelle architecture (demande manager) :
-- Score YOLO < 50%          → ignoré
-- Score YOLO 50% - 90%      → EfficientNet vérifie (vrai polype ?)
-                               + classifie le type (1p / 1s / 2 / 3)
-- Score YOLO > 90%          → classifie directement le type (1p / 1s / 2 / 3)
+Nouvelle architecture :
+- Score YOLO < 50%       -> ignore
+- Score YOLO 50% - 90%  -> EfficientNet verifie (vrai polype ?) + classifie le type
+- Score YOLO > 90%       -> classifie directement le type (1p / 1s / 2 / 3)
 
-EfficientNet gère maintenant 5 classes :
-  - normal        (faux positif YOLO)
-  - polype_1p     (pédiculé)
-  - polype_1s     (sessile)
-  - polype_2      (lésion plane)
-  - polype_3      (lésion ulcérée)
-
-Déploiement : Render.com (CPU uniquement)
+Modeles :
+- weights/yolo_best.pt                  : YOLO detection
+- weights/efficientnet_etage2.pt : classification (mauvaise_preparation / mici / normal / polype)
+- weights/efficientnet_polyp_types.pt   : classification type - 4 classes (1p/1s/2/3)
 """
 
 import io
-import json
 import logging
 import os
 
 import torch
 import torch.nn as nn
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from PIL import Image
 from pydantic import BaseModel
@@ -40,124 +34,151 @@ logger = logging.getLogger("medet-backend")
 # Configuration
 # -------------------------------------------------------------------------
 
-WEIGHTS_PATH = "weights/efficientnet_polyp_types.pt"
-META_PATH    = "weights/efficientnet_classes.json"
-yolo = YOLO("weights/yolo_best.pt")
+YOLO_WEIGHTS_PATH   = "weights/yolo_best.pt"
+BINARY_WEIGHTS_PATH = "weights/efficientnet_etage2.pt"
+TYPE_WEIGHTS_PATH   = "weights/efficientnet_polyp_types.pt"
 
-# Classes par défaut si pas de fichier de métadonnées
-DEFAULT_CLASS_NAMES = ["normal", "polype_1p", "polype_1s", "polype_2", "polype_3"]
 
-# Classes considérées comme "vrai polype" (pas faux positif)
-POLYP_CLASSES = {"polype_1p", "polype_1s", "polype_2", "polype_3"}
+TYPE_CLASSES = ["1p", "1s", "2", "3"]
+BINARY_CLASSES = [
+    "mauvaise_preparation",   
+    "mici",                   
+    "normal",                 
+    "polype"                  
+]
 
-# Labels lisibles pour l'équipe médicale
 POLYP_LABELS = {
-    "polype_1p": "Polype pédiculé (1p)",
-    "polype_1s": "Polype sessile (1s)",
-    "polype_2":  "Lésion plane (2)",
-    "polype_3":  "Lésion ulcérée (3)",
-    "normal":    "Pas de polype (faux positif YOLO)",
+    "1p": "Polype pédiculé (1p)",
+    "1s": "Polype sessile (1s)",
+    "2": "Lésion plane (2)",
+    "3": "Lésion ulcérée (3)",
+
+    "normal": "Pas de polype",
+    "mici": "MICI",
+    "mauvaise_preparation": "Mauvaise préparation",
 }
 
-# Forcer CPU pour déploiement VPS
+YOLO_LOW  = 0.50
+YOLO_HIGH = 0.90
+
 device = torch.device("cpu")
 
-# Charger les métadonnées si disponibles
-if os.path.exists(META_PATH):
-    with open(META_PATH) as f:
-        meta = json.load(f)
-    CLASS_NAMES = meta["class_names"]
-    IMAGE_SIZE  = meta.get("img_size", 224)
-    NORM_MEAN   = meta.get("normalize_mean", [0.485, 0.456, 0.406])
-    NORM_STD    = meta.get("normalize_std",  [0.229, 0.224, 0.225])
-    logger.info("Métadonnées chargées : %s", CLASS_NAMES)
-else:
-    CLASS_NAMES = DEFAULT_CLASS_NAMES
-    IMAGE_SIZE  = 224
-    NORM_MEAN   = [0.485, 0.456, 0.406]
-    NORM_STD    = [0.229, 0.224, 0.225]
-    logger.warning("Pas de fichier métadonnées — valeurs par défaut utilisées.")
-
+# Transform commun aux deux EfficientNet
 transform = transforms.Compose([
-    transforms.Resize((IMAGE_SIZE, IMAGE_SIZE)),
+    transforms.Resize((224, 224)),
     transforms.ToTensor(),
-    transforms.Normalize(NORM_MEAN, NORM_STD),
+    transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
 ])
 
 # -------------------------------------------------------------------------
-# Schémas de réponse
+# Schemas
 # -------------------------------------------------------------------------
 
 class PredictionResponse(BaseModel):
-    # Résultat principal
-    is_polyp: bool                      # vrai polype ou faux positif
-    polyp_type: str | None              # "polype_1p" / "polype_1s" / "polype_2" / "polype_3" / None
-    polyp_label: str                    # label lisible pour le médecin
-    confidence: float                   # confiance EfficientNet sur la classe prédite
-    all_probabilities: dict[str, float] # détail par classe
-
-    # Contexte YOLO
-    yolo_confidence: float              # score YOLO transmis par l'app
-    yolo_zone: str                      # "uncertain" (50-90%) ou "high" (>90%)
-
-    # Action effectuée
-    action: str                         # "verified_and_classified" | "directly_classified"
+    is_polyp:          bool
+    polyp_type:        str | None
+    polyp_label:       str
+    confidence:        float
+    all_probabilities: dict[str, float]
+    yolo_confidence:   float
+    yolo_zone:         str
+    action:            str
 
 
 class HealthResponse(BaseModel):
-    status: str
-    model_loaded: bool
-    device: str
-    class_names: list[str]
-    polyp_classes: list[str]
-    version: str
+    status:        str
+    yolo_loaded:   bool
+    binary_loaded: bool
+    type_loaded:   bool
+    device:        str
+    version:       str
 
 
 # -------------------------------------------------------------------------
-# Chargement du modèle
+# Chargement des modeles
 # -------------------------------------------------------------------------
 
-model = None
+yolo_model   = None
+binary_model = None
+type_model   = None
 
 
-def load_model():
-    global model
+def load_models():
+    global yolo_model, binary_model, type_model
+
+    # YOLO
     try:
-        eff = models.efficientnet_b0(weights=None)
-        eff.classifier[1] = nn.Linear(
-            eff.classifier[1].in_features, len(CLASS_NAMES)
-        )
-        eff.load_state_dict(torch.load(WEIGHTS_PATH, map_location="cpu"))
-        eff.to(device)
-        eff.eval()
-        model = eff
-        logger.info(
-            "EfficientNet chargé : %s — %d classes : %s",
-            WEIGHTS_PATH, len(CLASS_NAMES), CLASS_NAMES
-        )
-    except FileNotFoundError:
-        logger.warning("Poids introuvables (%s) — /predict renverra 503.", WEIGHTS_PATH)
-        model = None
+        if os.path.exists(YOLO_WEIGHTS_PATH):
+            yolo_model = YOLO(YOLO_WEIGHTS_PATH)
+            logger.info("YOLO charge : %s", YOLO_WEIGHTS_PATH)
+        else:
+            logger.warning("YOLO poids introuvables : %s", YOLO_WEIGHTS_PATH)
     except Exception:
-        logger.exception("Erreur chargement modèle")
-        model = None
+        logger.exception("Erreur chargement YOLO")
+
+    # EfficientNet Etage 2
+    # normal / polype / mici / mauvaise_preparation
+    print("===================================")
+    print("Chemin :", BINARY_WEIGHTS_PATH)
+    print("Existe ?", os.path.exists(BINARY_WEIGHTS_PATH))
+    print("===================================")
+
+    try:
+        eff_binary = models.efficientnet_b0(weights=None)
+
+        eff_binary.classifier[1] = nn.Linear(
+            eff_binary.classifier[1].in_features,
+            4
+        )
+
+        state = torch.load(BINARY_WEIGHTS_PATH, map_location="cpu")
+
+        print(type(state))
+
+        if isinstance(state, dict):
+            print(state.keys())
+
+        eff_binary.load_state_dict(state)
+        eff_binary.to(device)
+        eff_binary.eval()
+
+        binary_model = eff_binary
+        logger.info("EfficientNet Etage2 chargé.")
+        print("MODELE BINAIRE CHARGE")
+
+    except Exception as e:
+        print(e)
+    # EfficientNet types (1p / 1s / 2 / 3)
+    try:
+        if os.path.exists(TYPE_WEIGHTS_PATH):
+            eff_types = models.efficientnet_b0(weights=None)
+            eff_types.classifier[1] = nn.Linear(
+                eff_types.classifier[1].in_features, 4
+            )
+            eff_types.load_state_dict(
+                torch.load(TYPE_WEIGHTS_PATH, map_location="cpu")
+            )
+            eff_types.to(device).eval()
+            type_model = eff_types
+            logger.info("EfficientNet types charge.")
+        else:
+            logger.warning("Poids types introuvables : %s", TYPE_WEIGHTS_PATH)
+    except Exception:
+        logger.exception("Erreur chargement EfficientNet types")
 
 
 # -------------------------------------------------------------------------
-# Application
+# Application FastAPI
 # -------------------------------------------------------------------------
 
 app = FastAPI(
     title="medet — Classification fine des polypes",
     description=(
-        "Etage 2 (cloud) du pipeline hybride medet v3.\n\n"
-        "Reçoit une image détectée par YOLO (étage 1 local) avec son score "
-        "de confiance, et retourne :\n"
-        "- Si le score YOLO est entre 50% et 90% : vérifie si c'est un vrai "
-        "polype ET classifie le type (1p / 1s / 2 / 3)\n"
-        "- Si le score YOLO est > 90% : classifie directement le type sans "
-        "vérification (YOLO est déjà confiant)\n\n"
-        "Types de polypes : 1p (pédiculé), 1s (sessile), 2 (plan), 3 (ulcéré)"
+        "Pipeline hybride YOLO + EfficientNet v3.\n\n"
+        "YOLO < 50%  : ignore\n"
+        "YOLO 50-90% : verifie + classifie le type\n"
+        "YOLO > 90%  : classifie directement le type\n\n"
+        "Types : 1p (pediculé), 1s (sessile), 2 (plan), 3 (ulcere)"
     ),
     version="3.0.0",
 )
@@ -172,53 +193,41 @@ app.add_middleware(
 
 @app.on_event("startup")
 def on_startup():
-    load_model()
+    load_models()
 
 
 @app.get("/health", response_model=HealthResponse)
 def health_check():
     return HealthResponse(
         status="ok",
-        model_loaded=model is not None,
+        yolo_loaded=yolo_model is not None,
+        binary_loaded=binary_model is not None,
+        type_loaded=type_model is not None,
         device=str(device),
-        class_names=CLASS_NAMES,
-        polyp_classes=list(POLYP_CLASSES),
         version="3.0.0",
     )
 
 
 @app.post("/predict", response_model=PredictionResponse)
-async def predict(
-    file: UploadFile = File(...),
-    yolo_confidence: float = Form(...),  # score YOLO transmis par l'app (0.0 - 1.0)
-):
+async def predict(file: UploadFile = File(...)):
     """
-    Classifie une image détectée par YOLO.
+    Recoit une image, applique YOLO puis EfficientNet selon la zone de confiance.
 
-    Paramètres :
-    - file             : image (jpg/png) de la zone suspecte détectée par YOLO
-    - yolo_confidence  : score de confiance YOLO (entre 0.50 et 1.0)
-
-    Logique :
-    - 50% ≤ yolo_confidence < 90% → vérifie (vrai polype ?) + classifie le type
-    - yolo_confidence ≥ 90%       → classifie directement le type
+    Zone YOLO < 50%       : HTTPException 400 (ne devrait pas etre appele)
+    Zone YOLO 50% - 90%   : verifie vrai/faux polype + classifie le type
+    Zone YOLO > 90%       : classifie directement le type
     """
-    if model is None:
-        raise HTTPException(
-            status_code=503,
-            detail=f"Modèle non chargé. Vérifiez '{WEIGHTS_PATH}'.",
-        )
+    # Verification des modeles
+    if yolo_model is None:
+        raise HTTPException(status_code=503, detail="YOLO non charge.")
+    if type_model is None:
+        raise HTTPException(status_code=503, detail="EfficientNet types non charge.")
 
+    # Verification du fichier
     if not file.content_type or not file.content_type.startswith("image/"):
         raise HTTPException(
             status_code=400,
-            detail="Le fichier doit être une image (jpg, png...).",
-        )
-
-    if not (0.0 <= yolo_confidence <= 1.0):
-        raise HTTPException(
-            status_code=422,
-            detail="yolo_confidence doit être entre 0.0 et 1.0.",
+            detail="Le fichier doit etre une image (jpg, png...).",
         )
 
     # Lecture de l'image
@@ -226,67 +235,115 @@ async def predict(
         image_bytes = await file.read()
         image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
     except Exception:
+        raise HTTPException(status_code=400, detail="Impossible de lire l'image.")
+
+    # ---------------------------------------------------------------
+    # Etage 1 : YOLO
+    # ---------------------------------------------------------------
+    results = yolo_model.predict(source=image, conf=YOLO_LOW, verbose=False)
+
+    if len(results[0].boxes) == 0:
         raise HTTPException(
-            status_code=400,
-            detail="Impossible de lire l'image.",
+            status_code=404,
+            detail=f"Aucune detection YOLO au-dessus du seuil ({YOLO_LOW:.0%})."
         )
 
-    # Inférence EfficientNet
-    img_tensor = transform(image).unsqueeze(0).to(device)
-    with torch.no_grad():
-        outputs = model(img_tensor)
-        probs   = torch.softmax(outputs, dim=1)[0]
+    # Boite la plus confiante
+    box             = max(results[0].boxes, key=lambda b: float(b.conf[0]))
+    yolo_confidence = float(box.conf[0])
+    x1, y1, x2, y2 = map(int, box.xyxy[0])
+
+    # Filtrer les boites qui couvrent plus de 60% de l'image (faux positif evident)
+    W_img, H_img = image.size
+    box_area  = (x2 - x1) * (y2 - y1)
+    img_area  = W_img * H_img
+    if box_area / img_area > 0.60:
+        raise HTTPException(
+            status_code=400,
+            detail="Boite de detection trop grande (> 60% image) — faux positif ignore."
+        )
+
+    # Recadrer la region detectee par YOLO pour EfficientNet
+    roi        = image.crop((x1, y1, x2, y2))
+    img_tensor = transform(roi).unsqueeze(0).to(device)
+
+    # ---------------------------------------------------------------
+    # Determination de la zone YOLO
+    # ---------------------------------------------------------------
+    yolo_zone = "uncertain" if yolo_confidence < YOLO_HIGH else "high"
+
+    # ---------------------------------------------------------------
+    # Zone incertaine (50% - 90%) : verification binaire puis type
+    # ---------------------------------------------------------------
+    if yolo_zone == "uncertain":
+
+        # Etape 1 : verification normal / polype
+        if binary_model is None:
+            raise HTTPException(
+                status_code=503,
+                detail="EfficientNet binaire non charge (necessaire pour zone incertaine)."
+            )
+
+        with torch.no_grad():
+            binary_out   = binary_model(img_tensor)
+            binary_probs = torch.softmax(binary_out, dim=1)[0]
+            binary_pred = binary_probs.argmax().item()
+            predicted = BINARY_CLASSES[binary_pred]
+
+        if predicted != "polype":
+
+            return PredictionResponse(
+                is_polyp=False,
+                polyp_type=None,
+                polyp_label=POLYP_LABELS.get(predicted, predicted),
+                confidence=round(binary_probs[binary_pred].item(),4),
+                all_probabilities={
+                    c: round(p.item(),4)
+                    for c,p in zip(BINARY_CLASSES,binary_probs)
+                },
+                yolo_confidence=round(yolo_confidence,4),
+                yolo_zone=yolo_zone,
+                action="verified_and_classified",
+            )
+
+        # 1 = vrai polype -> classifier le type
+        with torch.no_grad():
+            type_out = type_model(img_tensor)
+
+        action = "verified_and_classified"
+
+    # ---------------------------------------------------------------
+    # Zone haute confiance (> 90%) : classification directe du type
+    # ---------------------------------------------------------------
+    else:
+        with torch.no_grad():
+            type_out = type_model(img_tensor)
+
+        action = "directly_classified"
+
+    # ---------------------------------------------------------------
+    # Classification du type (commune aux deux zones)
+    # ---------------------------------------------------------------
+    type_probs  = torch.softmax(type_out, dim=1)[0]
+    conf, idx   = torch.max(type_probs, dim=0)
+    polyp_type  = TYPE_CLASSES[idx.item()]
 
     all_probabilities = {
         cls: round(prob.item(), 4)
-        for cls, prob in zip(CLASS_NAMES, probs)
+        for cls, prob in zip(TYPE_CLASSES, type_probs)
     }
-    confidence, pred_idx = torch.max(probs, dim=0)
-    predicted_class = CLASS_NAMES[pred_idx.item()]
-
-    # ---------------------------------------------------------------
-    # Logique selon la zone YOLO
-    # ---------------------------------------------------------------
-
-    yolo_zone = "uncertain" if yolo_confidence < 0.90 else "high"
-
-    if yolo_zone == "uncertain":
-        # Zone 50%-90% : EfficientNet vérifie ET classifie
-        # Si EfficientNet dit "normal" → faux positif YOLO confirmé
-        is_polyp   = predicted_class in POLYP_CLASSES
-        polyp_type = predicted_class if is_polyp else None
-        action     = "verified_and_classified"
-
-    else:
-        # Zone >90% : YOLO très confiant → on classifie directement
-        # EfficientNet ne vérifie plus le "vrai/faux" mais donne le type
-        # Si EfficientNet dit quand même "normal" (cas rare), on garde "polype_1s" par défaut
-        if predicted_class in POLYP_CLASSES:
-            polyp_type = predicted_class
-        else:
-            # Prendre le type de polype avec la plus haute proba parmi les classes polype
-            polyp_probs = {
-                cls: all_probabilities[cls]
-                for cls in CLASS_NAMES if cls in POLYP_CLASSES
-            }
-            polyp_type = max(polyp_probs, key=polyp_probs.get)
-        is_polyp = True
-        action   = "directly_classified"
-
-    polyp_label = POLYP_LABELS.get(polyp_type or "normal", polyp_type or "normal")
 
     logger.info(
-        "YOLO=%.0f%% (%s) → EfficientNet=%s (%.0f%%) → is_polyp=%s type=%s",
+        "YOLO=%.0f%% (%s) -> type=%s (%.0f%%) action=%s",
         yolo_confidence * 100, yolo_zone,
-        predicted_class, confidence.item() * 100,
-        is_polyp, polyp_type
+        polyp_type, conf.item() * 100, action
     )
 
     return PredictionResponse(
-        is_polyp=is_polyp,
+        is_polyp=True,
         polyp_type=polyp_type,
-        polyp_label=polyp_label,
-        confidence=round(confidence.item(), 4),
+        polyp_label=POLYP_LABELS[polyp_type],
+        confidence=round(conf.item(), 4),
         all_probabilities=all_probabilities,
         yolo_confidence=round(yolo_confidence, 4),
         yolo_zone=yolo_zone,
