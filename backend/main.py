@@ -31,6 +31,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from PIL import Image
 from pydantic import BaseModel
 from torchvision import models, transforms
+from ultralytics import YOLO
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("medet-backend")
@@ -41,6 +42,7 @@ logger = logging.getLogger("medet-backend")
 
 WEIGHTS_PATH = "weights/efficientnet_polyp_types.pt"
 META_PATH    = "weights/efficientnet_classes.json"
+yolo = YOLO("weights/yolo_best.pt")
 
 # Classes par défaut si pas de fichier de métadonnées
 DEFAULT_CLASS_NAMES = ["normal", "polype_1p", "polype_1s", "polype_2", "polype_3"]
