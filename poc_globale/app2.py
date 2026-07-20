@@ -30,7 +30,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import streamlit as st
 from PIL import Image
-
+os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp"
 # -------------------------------------------------------------------
 # Palette & typographie — identité visuelle "clinique premium"
 # -------------------------------------------------------------------
@@ -71,10 +71,11 @@ plt.rcParams.update({
 YOLO_WEIGHTS_PATH   = "weights/best.pt"
 EFFICIENTNET_PATH   = "weights/efficientnet_etage2.pt"
 CLASS_NAMES         = ["mauvaise_preparation", "mici", "normal", "polype"]
-YOLO_CONF           = 0.50
-FRAME_SKIP          = 5       # 1 frame analysée sur N
-MIN_SEGMENT_DURATION = 0.5   # secondes
 
+DEFAULT_YOLO_LOW     = 0.25   # below this → not a polyp
+DEFAULT_YOLO_HIGH    = 0.90   # above this → polyp confirmed, no need for stage 2
+DEFAULT_FRAME_SKIP   = 5
+MIN_SEGMENT_DURATION = 0.5
 st.set_page_config(
     page_title="medet — Détection d'anomalies digestives",
     page_icon="🩺",
@@ -375,6 +376,66 @@ p, li, label, span { color: #14213D; }
 st.markdown(PREMIUM_CSS, unsafe_allow_html=True)
 
 # -------------------------------------------------------------------
+# Sidebar — Paramètres
+# -------------------------------------------------------------------
+
+with st.sidebar:
+    st.markdown("## ⚙️ Paramètres médicaux")
+
+    st.markdown("### Sensibilité YOLO (étage 1)")
+
+    YOLO_LOW = st.slider(
+        "Seuil minimum de détection",
+        min_value=0.10,
+        max_value=0.50,
+        value=DEFAULT_YOLO_LOW,
+        step=0.05,
+        help="En dessous de ce score → pas de polype détecté."
+    )
+
+    YOLO_HIGH = st.slider(
+        "Seuil de confiance élevée",
+        min_value=0.50,
+        max_value=0.99,
+        value=DEFAULT_YOLO_HIGH,
+        step=0.05,
+        help=(
+            "Au-dessus de ce score → polype confirmé directement par YOLO, "
+            "sans appel à EfficientNet."
+        )
+    )
+
+    st.info(
+        f"📊 Zone d'incertitude : **{YOLO_LOW:.0%} → {YOLO_HIGH:.0%}**\n\n"
+        "Dans cette plage, EfficientNet est appelé pour confirmer."
+    )
+
+    st.divider()
+
+    st.markdown("### Analyse vidéo")
+
+    FRAME_SKIP = st.slider(
+        "Analyser 1 frame sur N",
+        min_value=1,
+        max_value=15,
+        value=DEFAULT_FRAME_SKIP,
+        step=1,
+        help="Plus la valeur est haute, moins ça consomme de ressources."
+    )
+
+    MIN_SEGMENT_DURATION = st.slider(
+        "Durée minimale d'un segment (secondes)",
+        min_value=0.1,
+        max_value=3.0,
+        value=DEFAULT_FRAME_SKIP if False else 0.5,
+        step=0.1,
+        help="Ignore les détections trop courtes (bruit)."
+    )
+
+    st.divider()
+    st.caption("medet — pipeline hybride v2")
+    
+# -------------------------------------------------------------------
 # Chargement des modèles (mis en cache)
 # -------------------------------------------------------------------
 @st.cache_resource(show_spinner=False)
@@ -423,7 +484,7 @@ def predict_stage1_image(image: Image.Image):
         return detected, (1 if detected else 0)
 
     image.save("_tmp.jpg")
-    result = yolo_model.predict("_tmp.jpg", conf=YOLO_CONF, verbose=False)[0]
+    result = yolo_model.predict("_tmp.jpg", conf=YOLO_LOW, verbose=False)[0]
     return len(result.boxes) > 0, len(result.boxes)
 
 
@@ -448,25 +509,61 @@ def predict_stage2_image(image: Image.Image):
     return CLASS_NAMES[idx.item()], conf.item()
 
 
-def analyze_frame(frame_bgr):
+def analyze_frame(frame_bgr, yolo_low=None, yolo_high=None):
     """
-    Applique YOLO sur une frame BGR (numpy array).
-    Retourne (detected: bool, boxes: list of (x1,y1,x2,y2,conf)).
+    3-zone logic:
+    - conf < yolo_low              → not detected (no polyp)
+    - yolo_low <= conf < yolo_high → uncertain → call EfficientNet
+    - conf >= yolo_high            → confirmed directly by YOLO
+    
+    Returns (detected, boxes, stage)
+    stage: 'none' | 'yolo_only' | 'uncertain_sent_to_eff'
     """
+    low  = yolo_low  if yolo_low  is not None else YOLO_LOW
+    high = yolo_high if yolo_high is not None else YOLO_HIGH
+
     if DEMO_MODE:
-        detected = random.random() < 0.4
-        return detected, [(50, 50, 200, 200, 0.82)] if detected else []
+        conf_sim = random.uniform(0.1, 0.99)
+        if conf_sim < low:
+            return False, [], 'none'
+        elif conf_sim >= high:
+            return True, [(50, 50, 200, 200, conf_sim)], 'yolo_only'
+        else:
+            return True, [(50, 50, 200, 200, conf_sim)], 'uncertain_sent_to_eff'
 
-    result = yolo_model.predict(frame_bgr, conf=YOLO_CONF, verbose=False)[0]
+    result   = yolo_model.predict(frame_bgr, conf=low, verbose=False)[0]
     detected = len(result.boxes) > 0
-    boxes = []
-    if detected:
-        for box in result.boxes:
-            x1, y1, x2, y2 = box.xyxy[0].tolist()
-            c = float(box.conf[0])
-            boxes.append((x1, y1, x2, y2, c))
-    return detected, boxes
 
+    if not detected:
+        return False, [], 'none'
+
+    boxes = []
+    max_conf = 0.0
+    for box in result.boxes:
+        x1, y1, x2, y2 = box.xyxy[0].tolist()
+        c = float(box.conf[0])
+        boxes.append((x1, y1, x2, y2, c))
+        max_conf = max(max_conf, c)
+    # Filtrer les boîtes qui couvrent plus de 60% de l'image (faux positif évident)
+    H_img, W_img = frame_bgr.shape[:2]
+    image_area   = H_img * W_img
+
+    filtered_boxes = []
+    for (x1, y1, x2, y2, c) in boxes:
+        box_area = (x2 - x1) * (y2 - y1)
+        if box_area / image_area < 0.60:  # garde seulement les boîtes < 60% de l'image
+            filtered_boxes.append((x1, y1, x2, y2, c))
+
+    if not filtered_boxes:
+        return False, [], 'none'  # toutes les boîtes filtrées = pas de détection
+
+    boxes = filtered_boxes
+    max_conf = max(b[4] for b in boxes)
+    if max_conf >= high:
+        return True, boxes, 'yolo_only'       # confident enough, no stage 2
+    else:
+        return True, boxes, 'uncertain_sent_to_eff'  # uncertain → stage 2
+     
 
 def draw_boxes(frame_bgr, boxes):
     """Dessine les boîtes YOLO sur une frame et retourne une image PIL."""
@@ -587,7 +684,17 @@ def analyze_video_stream(video_path, progress_bar, segments_container):
             break
 
         if frame_idx % FRAME_SKIP == 0:
-            detected, boxes = analyze_frame(frame)
+            detected, boxes, stage = analyze_frame(frame, yolo_low=YOLO_LOW, yolo_high=YOLO_HIGH)
+
+        if detected and stage == 'uncertain_sent_to_eff':
+            pil_frame = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+            eff_class, eff_conf = predict_stage2_image(pil_frame)
+            if eff_class == 'normal':
+                detected = False
+                boxes    = []
+                stage    = 'none'
+            else:
+                stage = 'confirmed_by_eff'
             ts_s = frame_idx / fps
 
             rows.append({
@@ -696,7 +803,7 @@ with st.sidebar:
 
     st.divider()
     st.markdown("#### Paramètres actifs")
-    st.caption(f"Seuil de confiance YOLO : **{YOLO_CONF}**")
+    st.caption(f"Seuil de confiance YOLO : **{YOLO_LOW}**")
     st.caption(f"Frame analysée : 1 sur {FRAME_SKIP}")
     st.caption("Classes : " + ", ".join(CLASS_NAMES))
 
@@ -931,8 +1038,8 @@ elif input_type == " Vidéo":
 
                 ax1.plot(timestamps, conf_values, color=COLOR_TEAL,
                          linewidth=1.1, alpha=0.85, label="Confiance YOLO")
-                ax1.axhline(YOLO_CONF, color=COLOR_WARNING, linestyle="--",
-                            linewidth=1, label=f"Seuil ({YOLO_CONF})")
+                ax1.axhline(YOLO_LOW, color=COLOR_WARNING, linestyle="--",
+                            linewidth=1, label=f"Seuil ({YOLO_LOW})")
                 ax1.fill_between(
                     timestamps, conf_values,
                     where=detected_flags,
@@ -967,7 +1074,7 @@ elif input_type == " Vidéo":
             else:
                 st.info(
                     "ℹ️ Aucun polype détecté dans cette vidéo "
-                    f"(seuil de confiance : {YOLO_CONF})."
+                    f"(seuil de confiance : {YOLO_LOW})."
                 )
 
             # --- Export CSV ---
@@ -1039,7 +1146,7 @@ elif input_type == " Webcam (live)":
                 ts = fmt_time(elapsed)
 
                 if frame_idx % frame_skip_webcam == 0:
-                    detected, boxes = analyze_frame(frame)
+                    detected, boxes, stage = analyze_frame(frame)
 
                     if detected:
                         img_with_boxes = draw_boxes(frame, boxes)
@@ -1247,8 +1354,8 @@ elif input_type == "🔗 Flux réseau (URL)":
         )
         ax1.plot(timestamps, conf_values, color=COLOR_TEAL,
                  linewidth=1.0, alpha=0.85, label="Confiance YOLO")
-        ax1.axhline(YOLO_CONF, color=COLOR_WARNING, linestyle="--",
-                    linewidth=1, label=f"Seuil ({YOLO_CONF})")
+        ax1.axhline(YOLO_LOW, color=COLOR_WARNING, linestyle="--",
+                    linewidth=1, label=f"Seuil ({YOLO_LOW})")
         ax1.fill_between(timestamps, conf_values,
                          where=detected, alpha=0.28, color=COLOR_DANGER,
                          label="Détection active")
@@ -1315,7 +1422,7 @@ elif input_type == "🔗 Flux réseau (URL)":
                     ts = fmt_time(elapsed)
 
                     if frame_idx % frame_skip_url == 0:
-                        detected, boxes = analyze_frame(frame)
+                        detected, boxes, stage = analyze_frame(frame)
                         max_conf = max(b[4] for b in boxes) if boxes else 0.0
 
                         # Enregistrer la frame
