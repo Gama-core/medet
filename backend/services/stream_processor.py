@@ -22,7 +22,7 @@ def process_stream(request: StreamRequest) -> StreamResult:
     """
     start_time = time.perf_counter()
 
-    cap = cv2.VideoCapture(request.url)
+    cap = cv2.VideoCapture(request.url, cv2.CAP_FFMPEG)
     if not cap.isOpened():
         elapsed_ms = (time.perf_counter() - start_time) * 1000
         return StreamResult(
