@@ -123,3 +123,4 @@ Se connecte au flux et l'analyse pendant `duration_seconds` secondes maximum. Re
 - **CPU only** : le déploiement cible n'a pas de GPU — surveiller `processing_time_ms` en production, ajuster `frame_skip` si nécessaire.
 - **Déséquilibre du dataset de classification fine** : `1s` est largement mieux reconnu que `1p`, `2` et `3` (voir historique d'entraînement) — le recall sur ces 3 classes reste à améliorer avec plus de données annotées.
 - **Transport RTSP forcé en TCP** (`OPENCV_FFMPEG_CAPTURE_OPTIONS`) — nécessaire pour éviter les erreurs `Unsupported Transport` observées en test avec certains flux.
+test
