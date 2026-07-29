@@ -1,0 +1,30 @@
+name: Deploy Medet Backend Service
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - backend/**
+
+jobs:
+  deploy:
+    runs-on: [self-hosted, ci, build]
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+
+      - name: Ensure staging directory exists
+        run: sudo mkdir -p /usr/local/medet
+
+      - name: Copy backend files to staging
+        run: sudo cp -r backend/. /usr/local/medet/
+
+      - name: Run Ansible Playbook for Deployment
+        run: |
+          ansible-playbook /etc/ansible/deploy-medet.yml \
+            -i /etc/ansible/hosts/inventory.ini \
+            --extra-vars "dedicated_node=ais"
+        env:
+          ANSIBLE_HOST_KEY_CHECKING: "False"
