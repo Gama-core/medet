@@ -1,0 +1,43 @@
+name: Deploy Medet React Frontend
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - medet-react/**
+
+jobs:
+  deploy:
+    runs-on: [self-hosted, ci, build]
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install dependencies
+        working-directory: medet-react
+        run: npm ci
+
+      - name: Build
+        working-directory: medet-react
+        run: npm run build
+
+      - name: Ensure staging directory exists
+        run: sudo mkdir -p /usr/local/medet-react
+
+      - name: Copy built files to staging
+        run: sudo cp -r medet-react/dist /usr/local/medet-react/
+
+      - name: Run Ansible Playbook for Deployment
+        run: |
+          ansible-playbook /etc/ansible/deploy-medet-react.yml \
+            -i /etc/ansible/hosts/inventory.ini \
+            --extra-vars "dedicated_node=ais"
+        env:
+          ANSIBLE_HOST_KEY_CHECKING: "False"
