@@ -1,95 +1,38 @@
 flowchart TB
+  IMG["Image radiologique<br/>tube digestif"]
 
-    %% =======================
-    %% INPUTS
-    %% =======================
+  subgraph ETAGE1["Etage 1 - embarque mobile"]
+    YOLO["YOLO nano / small<br/>localisation rapide"]
+  end
 
-    subgraph INPUT["Input Sources"]
-        IMG["Image"]
-        VID["Video"]
-        CAM["Webcam"]
-        RTSP["RTSP Stream"]
-        HTTP["HTTP/HTTPS Stream"]
-    end
+  DEC{"Anomalie<br/>suspectee ?"}
 
-    %% =======================
-    %% BACKEND
-    %% =======================
+  subgraph ETAGE2["Etage 2 - cloud"]
+    EFF["EfficientNet<br/>transfer learning"]
+  end
 
-    subgraph BACKEND["FastAPI Backend"]
-        PRE["Frame Extraction / Preprocessing"]
+  subgraph CLASSES["4 classes detectees"]
+    C1["Normal"]
+    C2["Polype"]
+    C3["MICI"]
+    C4["Mauvaise_preparation"]
+  end
 
-        subgraph DET["Stage 1 - YOLO Detection"]
-            YOLO["YOLO Nano / Small"]
-        end
+  subgraph FUTUR["Evolution future"]
+    SWY["Hybride Swin / YOLO<br/>flux continu compresse"]
+    MOB["Application mobile"]
+    BACK["Backend"]
+  end
 
-        DEC{"Detection confidence"}
+  IMG --> YOLO --> DEC
+  DEC -->|non| C1
+  DEC -->|oui, image envoyee| EFF
+  EFF --> C2
+  EFF --> C3
+  EFF --> C4
+  EFF -.->|faux positif| C1
 
-        subgraph VERIFY["Stage 2 - Verification"]
-            BIN["EfficientNet<br/>Verification"]
-        end
-
-        subgraph CLASSIF["Stage 3 - Fine Classification"]
-            TYPE["EfficientNet<br/>Polyp Type"]
-        end
-    end
-
-    %% =======================
-    %% OUTPUTS
-    %% =======================
-
-    subgraph OUTPUT["Outputs"]
-        N1["Normal"]
-        M1["MICI"]
-        MP["Poor Preparation"]
-
-        subgraph POLYP["Polyp Types"]
-            P1["Pedunculated (1p)"]
-            P2["Sessile (1s)"]
-            P3["Flat Lesion (2)"]
-            P4["Ulcerated Lesion (3)"]
-        end
-    end
-
-    %% =======================
-    %% CLIENTS
-    %% =======================
-
-    subgraph CLIENT["Clients"]
-        STREAM["Streamlit"]
-        MOBILE["Flutter Mobile App"]
-    end
-
-    %% =======================
-    %% FLOW
-    %% =======================
-
-    IMG --> PRE
-    VID --> PRE
-    CAM --> PRE
-    RTSP --> PRE
-    HTTP --> PRE
-
-    PRE --> YOLO
-
-    YOLO --> DEC
-
-    DEC -->|"Confidence < 50%"| N1
-
-    DEC -->|"50% - 90%"| BIN
-
-    BIN -->|"Not Polyp"| N1
-    BIN -->|"Confirmed Polyp"| TYPE
-
-    DEC -->|"> 90%"| TYPE
-
-    TYPE --> P1
-    TYPE --> P2
-    TYPE --> P3
-    TYPE --> P4
-
-    TYPE -.-> M1
-    TYPE -.-> MP
-
-    STREAM --> BACKEND
-    MOBILE --> BACKEND
+  ETAGE1 -.-> FUTUR
+  ETAGE2 -.-> FUTUR
+  SWY --- MOB
+  MOB --- BACK

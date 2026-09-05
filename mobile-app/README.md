@@ -1,89 +1,77 @@
-# medet — Application mobile (Flutter)
+# POC Vidéo — Détection de polypes sur images et vidéos
 
-Squelette initial de l'app mobile : liste des examens récents (anonymes), détail d'un examen (segments détectés), et partage avec un confrère via lien.
+Interface de démonstration étendue du pipeline hybride **medet**,
+permettant l'analyse aussi bien d'**images statiques** que de
+**vidéos d'endoscopie** (coloscopie, endoscopie digestive).
 
----
+Développée suite à la demande de l'équipe médicale lors de la réunion
+de présentation du POC initial.
 
-## 1. Structure
+## Contenu du dossier
 
 ```
-mobile_app/
-├── pubspec.yaml
-└── lib/
-    ├── main.dart                      # Point d'entrée
-    ├── theme/
-    │   └── app_theme.dart             # Couleurs/thème (cohérent avec l'app Streamlit)
-    ├── models/
-    │   └── record.dart                # Segment, RecordSummary, RecordDetail
-    ├── services/
-    │   └── api_service.dart           # Appels HTTP vers le backend FastAPI
-    ├── screens/
-    │   ├── home_screen.dart           # Liste des examens récents
-    │   └── record_detail_screen.dart  # Détail d'un examen + segments
-    └── widgets/
-        ├── record_card.dart           # Carte d'un examen dans la liste
-        └── share_dialog.dart          # Génération + partage du lien
+poc_video/
+├── app2.py                  interface Streamlit (images + vidéos)
+├── requirements.txt         dépendances Python
+├── weights/
+│   ├── yolo_polype_best.pt  poids YOLO (étage 1, détection locale)
+│   └── efficientnet_etage2.pt  poids EfficientNet (étage 2, cloud)
+├── .streamlit/
+│   └── config.toml          config Streamlit (limite upload étendue)
+└── README.md
 ```
 
----
+## Fonctionnalités
 
-## 2. Installation
+### Mode image
+- Upload d'une image (JPG, PNG).
+- Étage 1 (YOLO) : détection locale de présence d'anomalie.
+- Étage 2 (EfficientNet) : classification précise si anomalie détectée
+  (`normal`, `polype`, `mici`, `mauvaise_preparation`).
+- Résultat final avec code couleur.
 
-Prérequis : Flutter SDK installé (`flutter --version` pour vérifier).
+### Mode vidéo
+- Upload de vidéos d'endoscopie (AVI, MP4, MOV), sans limite de taille.
+- Analyse frame par frame avec YOLO.
+- **Affichage en temps réel** des segments détectés au fur et à mesure
+  de l'analyse (pas besoin d'attendre la fin de la vidéo).
+- Pour chaque segment détecté :
+  - Timestamp précis (début → fin)
+  - Numéro de frame exacte
+  - Frame clé avec boîte de localisation du polype dessinée
+  - Score de confiance
+- Graphique de présence du polype sur toute la durée de la vidéo.
+- Export du rapport de détection en CSV (timestamps, frames, confiances).
+
+## Dataset utilisé pour les tests
+
+**HyperKvasir** (vidéos de colonoscopie annotées par des
+gastro-entérologues) — sous-dossier `polyps/`.
+Source : https://datasets.simula.no/hyper-kvasir/
+
+## Installation et lancement
 
 ```bash
-cd mobile_app
-flutter pub get
+pip install -r requirements.txt
+streamlit run app2.py
 ```
 
----
+## Configuration de la limite d'upload
 
-## 3. Configurer l'URL du backend
+Le fichier `.streamlit/config.toml` étend la limite d'upload à 10 Go :
 
-Dans `lib/services/api_service.dart` :
-
-```dart
-ApiService({this.baseUrl = 'http://10.0.2.2:8000'});
+```toml
+[server]
+maxUploadSize = 10240
 ```
 
-- **Émulateur Android** : `10.0.2.2` pointe automatiquement vers le `localhost` de ta machine — garde tel quel si le backend tourne sur ton PC pendant les tests.
-- **Simulateur iOS** : remplace par `http://localhost:8000` (fonctionne différemment de l'émulateur Android).
-- **Téléphone physique / VPS déployé** : remplace par l'IP ou le domaine réel, ex `https://medet.tondomaine.com`.
+## Mode démo
 
----
+Si les poids (`weights/`) sont absents, l'application bascule
+automatiquement en mode démo (prédictions simulées) avec un avertissement
+visuel — permettant de présenter l'interface sans modèle disponible.
 
-## 4. Lancer l'app
+## Avertissement
 
-```bash
-flutter run
-```
-
-Sélectionne l'émulateur/simulateur ou l'appareil physique connecté quand Flutter te le propose.
-
----
-
-## 5. Ce qui est fait dans cette première version
-
-- ✅ Écran d'accueil : liste des examens récents (`GET /records`), avec type de source, types de polypes détectés, indicateur de partage actif.
-- ✅ Écran de détail : tous les segments détectés d'un examen (`GET /records/{id}`), avec timestamps, confiance, nombre de frames.
-- ✅ Partage : génère un lien via `POST /records/{id}/share`, puis ouvre le sélecteur de partage natif (Messages, Mail, WhatsApp...) via `share_plus`.
-- ✅ Suppression d'un examen (`DELETE /records/{id}`).
-
-## 6. Ce qui n'est PAS encore fait (prochaines étapes)
-
-- Écran de capture (image/vidéo/webcam) — pour l'instant, l'app suppose que les examens sont déjà créés côté backend (ex: par l'app Streamlit ou un autre client).
-- Authentification / gestion des utilisateurs médecins.
-- Visionnage direct du flux vidéo depuis l'app (nécessiterait l'intégration HLS évoquée précédemment pour le Mode 4).
-- Mode hors-ligne / cache local.
-
----
-
-## 7. Rappel important — confidentialité
-
-Aucun écran de cette app ne doit jamais afficher ou demander une identité réelle de patient (nom, date de naissance, numéro de dossier). Le champ `referenceLabel` est un texte libre de repérage pour le médecin uniquement (ex: "Salle 2 - matin") — à respecter dans tout développement futur sur cet écran.
-
----
-
-## 8. Limite de cet environnement de développement
-
-Ce squelette a été écrit et vérifié pour sa cohérence de structure et de syntaxe, mais **n'a pas pu être compilé ni exécuté ici** (pas de SDK Flutter/Dart disponible dans cet environnement). Lance `flutter pub get` puis `flutter analyze` en premier chez toi pour repérer d'éventuelles erreurs avant de builder — normal pour un premier passage, dis-moi les erreurs exactes si `flutter analyze` en remonte, je corrige directement.
+Ce POC est un outil de test interne. Il n'est pas destiné à un usage
+clinique et ne doit pas être utilisé pour une décision médicale réelle.

@@ -1,0 +1,15 @@
+{
+    "cmake.ignoreCMakeListsMissing": true,
+    "files.exclude": {
+        "backend/venv": true
+    },
+    "search.exclude": {
+        "backend/venv": true
+    },
+    "files.watcherExclude": {
+        "backend/venv/**": true
+    },
+    "python.analysis.exclude": [
+        "backend/venv/**"
+    ]
+}

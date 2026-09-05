@@ -12,6 +12,30 @@ npm run dev
 ```
 
 Par défaut, le frontend appelle `http://localhost:8000` (votre backend FastAPI).
+Assurez-vous que le backend local tourne et a été redémarré après toute
+modification de `backend/routers/stream.py`.
+
+Si vous utilisez le mode Flux réseau avec un flux RTSP local, le backend doit
+être sur la même machine que le flux. Dans ce cas, utilisez une URL locale comme :
+
+```text
+rtsp://localhost:8554/mystream
+```
+
+ou bien :
+
+```text
+rtsp://127.0.0.1:8554/mystream
+```
+
+Si le backend est sur un autre ordinateur ou serveur, `localhost`/`127.0.0.1`
+ne fonctionnera pas pour le flux RTSP. Utilisez alors l'adresse IP accessible
+depuis le serveur, par exemple :
+
+```text
+rtsp://192.168.x.y:8554/mystream
+```
+
 CORS doit être activé côté backend pour l'origine `http://localhost:5173`
 (ou votre domaine de prod) :
 

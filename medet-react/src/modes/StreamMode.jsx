@@ -19,7 +19,7 @@ function withTimeout(promise, ms) {
 
 export default function StreamMode() {
   const settings = useSettings();
-  const [url, setUrl] = useState("rtsp://127.0.0.1:8554/mystream");
+  const [url, setUrl] = useState("rtsp://camera-ip:8554/mystream");
   const [error, setError] = useState(null);
 
   // ---- Mode LIVE (session persistante, vraie frame par frame) ----
@@ -174,7 +174,7 @@ export default function StreamMode() {
           type="url"
           value={url}
           onChange={(e) => setUrl(e.target.value)}
-          placeholder="rtsp://127.0.0.1:8554/mystream"
+          placeholder="rtsp://camera-ip:8554/mystream"
           disabled={liveRunning || loading}
         />
 

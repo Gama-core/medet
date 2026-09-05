@@ -4,14 +4,15 @@ import 'package:flutter/material.dart';
 /// Streamlit (fond clair, bleu clair pour les actions, vert/orange/rouge pour
 /// les statuts).
 class AppColors {
-  static const primaryBlue = Color(0xFF2E9BE8);
-  static const lightBlue = Color(0xFFEAF4FC);
-  static const darkText = Color(0xFF14213D);
-  static const mutedText = Color(0xFF5C6B7A);
-  static const background = Color(0xFFF7FAFC);
-  static const success = Color(0xFF2E7D32);
+  static const primaryBlue = Color(0xFF00B4D8); // Turquoise vif
+  static const accentTurquoise = Color(0xFF48CAE4);
+  static const lightBlue = Color(0xFFCAF0F8);
+  static const darkText = Color(0xFF03045E);
+  static const mutedText = Color(0xFF0077B6);
+  static const background = Color(0xFFF0F9FF);
+  static const success = Color(0xFF2D6A4F);
   static const warning = Color(0xFFF9A825);
-  static const danger = Color(0xFFC2185B);
+  static const danger = Color(0xFFC9184A);
 }
 
 ThemeData buildAppTheme() {

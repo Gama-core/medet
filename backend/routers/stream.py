@@ -5,6 +5,7 @@ import base64
 import time
 import uuid
 from typing import Dict, Optional
+from urllib.parse import urlparse
 
 import cv2
 from fastapi import APIRouter, HTTPException

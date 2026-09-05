@@ -28,6 +28,7 @@ import cv2
 import matplotlib.patches as patches
 import matplotlib.pyplot as plt
 import numpy as np
+import plotly.graph_objects as go
 import streamlit as st
 from PIL import Image
 os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp"
@@ -70,7 +71,15 @@ plt.rcParams.update({
 
 YOLO_WEIGHTS_PATH   = "weights/best.pt"
 EFFICIENTNET_PATH   = "weights/efficientnet_etage2.pt"
+TYPE_WEIGHTS_PATH    = "weights/efficientnet_polyp_types.pt"
 CLASS_NAMES         = ["mauvaise_preparation", "mici", "normal", "polype"]
+TYPE_CLASSES        = ["1p", "1s", "2", "3"]
+TYPE_LABELS = {
+    "1p": "Pédiculé (1p)",
+    "1s": "Sessile (1s)",
+    "2":  "Lésion plane (2)",
+    "3":  "Lésion ulcérée (3)",
+}
 
 DEFAULT_YOLO_LOW     = 0.25   # below this → not a polyp
 DEFAULT_YOLO_HIGH    = 0.90   # above this → polyp confirmed, no need for stage 2
@@ -442,6 +451,7 @@ with st.sidebar:
 def load_models():
     yolo_model = None
     eff_model  = None
+    type_model = None
 
     try:
         from ultralytics import YOLO
@@ -467,10 +477,27 @@ def load_models():
     except Exception:
         pass
 
-    return yolo_model, eff_model
+    try:
+        import torch
+        import torch.nn as nn
+        from torchvision import models
 
-yolo_model, eff_model = load_models()
+        if os.path.exists(TYPE_WEIGHTS_PATH):
+            typ = models.efficientnet_b0(weights=None)
+            typ.classifier[1] = nn.Linear(
+                typ.classifier[1].in_features, len(TYPE_CLASSES)
+            )
+            typ.load_state_dict(torch.load(TYPE_WEIGHTS_PATH, map_location="cpu"))
+            typ.eval()
+            type_model = typ
+    except Exception:
+        pass
+
+    return yolo_model, eff_model, type_model
+
+yolo_model, eff_model, type_model = load_models()
 DEMO_MODE = (yolo_model is None) or (eff_model is None)
+TYPE_DEMO_MODE = type_model is None
 
 # -------------------------------------------------------------------
 # Fonctions de prédiction
@@ -507,6 +534,30 @@ def predict_stage2_image(image: Image.Image):
         probs = torch.softmax(out, dim=1)
         conf, idx = torch.max(probs, dim=1)
     return CLASS_NAMES[idx.item()], conf.item()
+
+
+def predict_stage3_type(image: Image.Image):
+    """
+    Étage 2b — classification fine du type de polype sur une image PIL.
+    Retourne (type_code, confiance). type_code ∈ {"1p", "1s", "2", "3"}.
+    N'a de sens que si l'image contient déjà un polype confirmé (étage 1/2).
+    """
+    if TYPE_DEMO_MODE:
+        time.sleep(0.4)
+        return random.choice(TYPE_CLASSES), random.uniform(0.55, 0.97)
+
+    import torch
+    from torchvision import transforms
+    transform = transforms.Compose([
+        transforms.Resize((224, 224)),
+        transforms.ToTensor(),
+    ])
+    tensor = transform(image.convert("RGB")).unsqueeze(0)
+    with torch.no_grad():
+        out = type_model(tensor)
+        probs = torch.softmax(out, dim=1)
+        conf, idx = torch.max(probs, dim=1)
+    return TYPE_CLASSES[idx.item()], conf.item()
 
 
 def analyze_frame(frame_bgr, yolo_low=None, yolo_high=None):
@@ -591,6 +642,134 @@ def draw_boxes(frame_bgr, boxes):
     return Image.open(buf)
 
 
+def find_segment_at_time(segments, t):
+    """Retourne le segment (dict) dont l'intervalle [start_s, end_s] contient t,
+    ou le segment le plus proche si aucun ne contient exactement t."""
+    if not segments:
+        return None
+    for seg in segments:
+        if seg["start_s"] - 0.05 <= t <= seg["end_s"] + 0.05:
+            return seg
+    # Aucun match exact : renvoyer le segment le plus proche
+    return min(segments, key=lambda s: min(abs(s["start_s"] - t), abs(s["end_s"] - t)))
+
+
+def render_interactive_timeline(timestamps, conf_values, detected_flags, segments,
+                                 chart_key, title="Timeline"):
+    """
+    Construit un graphique Plotly interactif (confiance dans le temps + bandes
+    des segments détectés) et retourne le segment sélectionné si l'utilisateur
+    clique sur un point du graphique, sinon None.
+    """
+    if not timestamps:
+        st.info("Pas encore de données à afficher.")
+        return None
+
+    fig = go.Figure()
+
+    fig.add_trace(go.Scatter(
+        x=timestamps, y=conf_values, mode="lines",
+        line=dict(color=COLOR_TEAL, width=1.4),
+        name="Confiance YOLO",
+        hovertemplate="t=%{x:.1f}s — confiance : %{y:.0%}<extra></extra>",
+    ))
+
+    for i, seg in enumerate(segments):
+        type_lbl = TYPE_LABELS.get(seg.get("polyp_type"), "Type inconnu") \
+            if seg.get("polyp_type") else "Anomalie"
+        fig.add_vrect(
+            x0=seg["start_s"], x1=max(seg["end_s"], seg["start_s"] + 0.15),
+            fillcolor=COLOR_DANGER, opacity=0.18, line_width=0,
+        )
+        fig.add_trace(go.Scatter(
+            x=[(seg["start_s"] + seg["end_s"]) / 2], y=[max(conf_values) * 1.05 if conf_values else 1],
+            mode="markers",
+            marker=dict(size=10, color=COLOR_DANGER, symbol="diamond"),
+            name=type_lbl if i == 0 else None,
+            showlegend=(i == 0),
+            hovertemplate=(
+                f"<b>{type_lbl}</b><br>"
+                f"{seg['start_ts']} → {seg['end_ts']}<br>"
+                f"confiance max : {seg['max_conf']:.0%}<extra></extra>"
+            ),
+            customdata=[i],
+        ))
+
+    fig.update_layout(
+        title=title,
+        xaxis_title="Temps (secondes)",
+        yaxis_title="Confiance",
+        yaxis_range=[0, 1.15],
+        height=340,
+        margin=dict(l=10, r=10, t=40, b=10),
+        plot_bgcolor=COLOR_SURFACE,
+        paper_bgcolor=COLOR_SURFACE,
+        font=dict(color=COLOR_INK, family="IBM Plex Sans"),
+        hovermode="closest",
+    )
+
+    event = st.plotly_chart(
+        fig, use_container_width=True, key=chart_key,
+        on_select="rerun", selection_mode="points",
+    )
+
+    with st.expander("🔧 Debug — structure brute de l'événement (temporaire)", expanded=False):
+        st.write("Type :", type(event))
+        st.write(event)
+        st.write("Contenu de session_state[chart_key] :")
+        st.write(st.session_state.get(chart_key))
+
+    clicked_t = None
+    if isinstance(event, dict):
+        points = event.get("selection", {}).get("points")
+        if points:
+            clicked_t = points[0].get("x")
+    elif hasattr(event, "selection"):
+        # Certaines versions renvoient un objet (pas un dict) avec un attribut .selection
+        sel = event.selection
+        points = sel.get("points") if isinstance(sel, dict) else getattr(sel, "points", None)
+        if points:
+            first = points[0]
+            clicked_t = first.get("x") if isinstance(first, dict) else getattr(first, "x", None)
+
+    # Si toujours rien, tente de lire directement depuis session_state (mécanisme
+    # standard des widgets avec une clé, plus fiable selon les versions).
+    if clicked_t is None:
+        state_val = st.session_state.get(chart_key)
+        if isinstance(state_val, dict):
+            points = state_val.get("selection", {}).get("points")
+            if points:
+                clicked_t = points[0].get("x")
+
+    if clicked_t is not None:
+        return find_segment_at_time(segments, clicked_t)
+    return None
+
+
+def render_selected_segment(seg, get_frame_fn=None):
+    """Affiche le détail d'un segment sélectionné (clic sur le graphique)."""
+    if seg is None:
+        return
+    st.markdown("#### 🔍 Segment sélectionné")
+    type_lbl = TYPE_LABELS.get(seg.get("polyp_type")) if seg.get("polyp_type") else None
+    col1, col2 = st.columns([1, 2])
+    with col1:
+        st.markdown(f"**Début :** `{seg['start_ts']}`")
+        st.markdown(f"**Fin :** `{seg['end_ts']}`")
+        st.markdown(f"**Durée :** {seg['duration_s']:.1f}s")
+        st.markdown(f"**Confiance max :** {seg['max_conf']:.0%}")
+        if type_lbl:
+            st.markdown(f"**Type :** {type_lbl} ({seg.get('type_conf', 0):.0%})")
+    with col2:
+        frame_bgr = seg.get("best_frame_bgr")
+        boxes = seg.get("best_boxes")
+        if frame_bgr is None and get_frame_fn is not None and seg.get("best_frame_idx") is not None:
+            frame_bgr = get_frame_fn(seg["best_frame_idx"])
+        if frame_bgr is not None:
+            img = draw_boxes(frame_bgr, boxes or [])
+            st.image(img, width="stretch")
+
+
 def fmt_time(seconds):
     """Formate un nombre de secondes en HH:MM:SS."""
     h = int(seconds // 3600)
@@ -620,6 +799,8 @@ def analyze_video_stream(video_path, progress_bar, segments_container):
     seg_best_frame_idx = None
     seg_best_frame_bgr = None
     seg_best_boxes = []
+    seg_best_type = None
+    seg_best_type_conf = 0.0
     seg_n = 0
     gap_threshold = (FRAME_SKIP / fps) * 3
 
@@ -627,6 +808,7 @@ def analyze_video_stream(video_path, progress_bar, segments_container):
         """Ferme le segment courant et l'affiche immédiatement."""
         nonlocal seg_start, seg_end, seg_max_conf
         nonlocal seg_best_frame_idx, seg_best_frame_bgr, seg_best_boxes, seg_n
+        nonlocal seg_best_type, seg_best_type_conf
 
         dur = seg_end - seg_start
         if dur < MIN_SEGMENT_DURATION:
@@ -639,6 +821,8 @@ def analyze_video_stream(video_path, progress_bar, segments_container):
             "max_conf": round(seg_max_conf, 4),
             "best_frame_idx": seg_best_frame_idx,
             "n_frames": seg_n,
+            "polyp_type": seg_best_type,
+            "type_conf": round(seg_best_type_conf, 4) if seg_best_type else None,
         }
         segments.append(seg)
 
@@ -646,11 +830,15 @@ def analyze_video_stream(video_path, progress_bar, segments_container):
         with segments_container:
             idx = len(segments)
             with st.container(border=True):
+                type_suffix = (
+                    f" — **{TYPE_LABELS[seg['polyp_type']]}**"
+                    if seg["polyp_type"] else ""
+                )
                 st.markdown(
                     f"#### 🔴 Segment {idx} détecté — "
                     f"{seg['start_ts']} → {seg['end_ts']} "
                     f"| {seg['duration_s']:.1f}s "
-                    f"| confiance : {seg['max_conf']:.0%}"
+                    f"| confiance : {seg['max_conf']:.0%}{type_suffix}"
                 )
                 col_info, col_frame = st.columns([1, 2])
                 with col_info:
@@ -659,6 +847,11 @@ def analyze_video_stream(video_path, progress_bar, segments_container):
                     st.markdown(f"**Durée :** {seg['duration_s']:.1f} secondes")
                     st.markdown(f"**Frame :** #{seg['best_frame_idx']}")
                     st.markdown(f"**Confiance :** {seg['max_conf']:.0%}")
+                    if seg["polyp_type"]:
+                        st.markdown(
+                            f"**Type de polype :** {TYPE_LABELS[seg['polyp_type']]} "
+                            f"({seg['type_conf']:.0%})"
+                        )
                 with col_frame:
                     if seg_best_frame_bgr is not None:
                         img_with_boxes = draw_boxes(seg_best_frame_bgr, seg_best_boxes)
@@ -668,13 +861,15 @@ def analyze_video_stream(video_path, progress_bar, segments_container):
                                 f"Frame #{seg['best_frame_idx']} "
                                 f"à {seg['start_ts']}"
                             ),
-                            use_column_width=True
+                            width="stretch"
                         )
 
         # Réinitialiser
         seg_start = seg_end = seg_best_frame_idx = None
         seg_best_frame_bgr = None
         seg_best_boxes = []
+        seg_best_type = None
+        seg_best_type_conf = 0.0
         seg_max_conf = 0
         seg_n = 0
 
@@ -689,12 +884,15 @@ def analyze_video_stream(video_path, progress_bar, segments_container):
         if detected and stage == 'uncertain_sent_to_eff':
             pil_frame = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
             eff_class, eff_conf = predict_stage2_image(pil_frame)
+            polyp_type, type_conf = (None, None)
             if eff_class == 'normal':
                 detected = False
                 boxes    = []
                 stage    = 'none'
             else:
                 stage = 'confirmed_by_eff'
+                if eff_class == 'polype':
+                    polyp_type, type_conf = predict_stage3_type(pil_frame)
             ts_s = frame_idx / fps
 
             rows.append({
@@ -705,10 +903,15 @@ def analyze_video_stream(video_path, progress_bar, segments_container):
                 "n_boxes": len(boxes),
                 "max_conf": round(max(b[4] for b in boxes), 4) if boxes else 0.0,
                 "boxes": boxes,
+                "polyp_type": polyp_type,
+                "type_conf": round(type_conf, 4) if type_conf is not None else None,
             })
 
             if detected:
                 max_conf = max(b[4] for b in boxes)
+                same_type_vid = (seg_best_type == polyp_type)
+                gap_ok_vid = (seg_start is not None and ts_s - seg_end <= gap_threshold)
+
                 if seg_start is None:
                     # Début d'un nouveau segment
                     seg_start = ts_s
@@ -717,9 +920,11 @@ def analyze_video_stream(video_path, progress_bar, segments_container):
                     seg_best_frame_idx = frame_idx
                     seg_best_frame_bgr = frame.copy()
                     seg_best_boxes = boxes
+                    seg_best_type = polyp_type
+                    seg_best_type_conf = type_conf or 0.0
                     seg_n = 1
-                elif ts_s - seg_end <= gap_threshold:
-                    # Continuation du segment
+                elif same_type_vid and gap_ok_vid:
+                    # Continuation du segment (même type de polype)
                     seg_end = ts_s
                     seg_n += 1
                     if max_conf > seg_max_conf:
@@ -727,8 +932,10 @@ def analyze_video_stream(video_path, progress_bar, segments_container):
                         seg_best_frame_idx = frame_idx
                         seg_best_frame_bgr = frame.copy()
                         seg_best_boxes = boxes
+                        seg_best_type = polyp_type
+                        seg_best_type_conf = type_conf or 0.0
                 else:
-                    # Gap trop grand → fermer et afficher le segment
+                    # Type différent OU gap trop grand → fermer et afficher le segment
                     close_and_display_segment()
                     # Commencer un nouveau segment
                     seg_start = ts_s
@@ -737,6 +944,8 @@ def analyze_video_stream(video_path, progress_bar, segments_container):
                     seg_best_frame_idx = frame_idx
                     seg_best_frame_bgr = frame.copy()
                     seg_best_boxes = boxes
+                    seg_best_type = polyp_type
+                    seg_best_type_conf = type_conf or 0.0
                     seg_n = 1
             else:
                 # Pas de détection — fermer le segment si on en avait un
@@ -798,14 +1007,21 @@ with st.sidebar:
         if eff_model is not None
         else '<span class="medet-chip medet-chip-demo">🟡 Démo</span>'
     )
+    type_chip = (
+        '<span class="medet-chip medet-chip-ok">🟢 Chargé</span>'
+        if type_model is not None
+        else '<span class="medet-chip medet-chip-demo">🟡 Démo</span>'
+    )
     st.markdown(f"**Étage 1 — YOLO (local)**<br>{yolo_chip}", unsafe_allow_html=True)
     st.markdown(f"**Étage 2 — EfficientNet (cloud)**<br>{eff_chip}", unsafe_allow_html=True)
+    st.markdown(f"**Étage 2b — Type de polype**<br>{type_chip}", unsafe_allow_html=True)
 
     st.divider()
     st.markdown("#### Paramètres actifs")
     st.caption(f"Seuil de confiance YOLO : **{YOLO_LOW}**")
     st.caption(f"Frame analysée : 1 sur {FRAME_SKIP}")
     st.caption("Classes : " + ", ".join(CLASS_NAMES))
+    st.caption("Types de polype : " + ", ".join(TYPE_CLASSES))
 
     st.divider()
     st.caption("Usage interne uniquement — pas d'utilisation clinique.")
@@ -861,30 +1077,56 @@ if input_type == " Image":
         col1, col2 = st.columns([1, 1])
 
         with col1:
-            st.image(image, caption="Image envoyée", use_column_width=True)
+            st.image(image, caption="Image envoyée", width="stretch")
 
         with col2:
             st.markdown("### Déroulé du pipeline")
 
+            frame_bgr = cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR)
+
             with st.spinner("Étage 1 — analyse locale (YOLO)..."):
-                detected, n_boxes = predict_stage1_image(image)
+                detected, boxes, stage = analyze_frame(frame_bgr)
 
-            if detected:
-                st.success(f"**Étage 1 (YOLO)** : anomalie détectée ({n_boxes} zone(s))")
-                st.markdown("→ *Image envoyée à l'étage 2 (cloud)*")
+            final_class = "normal"
+            polyp_type, type_conf = (None, None)
 
-                with st.spinner("Étage 2 — classification précise (EfficientNet)..."):
-                    cloud_class, cloud_conf = predict_stage2_image(image)
-
-                st.success(
-                    f"**Étage 2 (EfficientNet)** : **{cloud_class.upper()}** "
-                    f"(confiance : {cloud_conf:.0%})"
-                )
-                final_class = cloud_class
-            else:
+            if not detected:
                 st.info("**Étage 1 (YOLO)** : aucune anomalie détectée")
                 st.markdown("→ *Pas d'appel cloud*")
-                final_class = "normal"
+            else:
+                n_boxes = len(boxes)
+                max_conf = max(b[4] for b in boxes)
+                st.success(f"**Étage 1 (YOLO)** : anomalie détectée ({n_boxes} zone(s), confiance {max_conf:.0%})")
+
+                if stage == 'yolo_only':
+                    # > seuil haut : YOLO déjà confiant → pas de vérification, classification directe du type
+                    st.markdown("→ *Confiance élevée : classification directe du type (étage 2b)*")
+                    final_class = "polype"
+                    with st.spinner("Étage 2b — classification du type de polype..."):
+                        polyp_type, type_conf = predict_stage3_type(image)
+                    st.success(
+                        f"**Étage 2b (type)** : **{TYPE_LABELS[polyp_type]}** "
+                        f"(confiance : {type_conf:.0%})"
+                    )
+                else:
+                    # Zone d'incertitude : EfficientNet vérifie AVANT tout affichage de résultat
+                    st.markdown("→ *Zone d'incertitude : vérification par l'étage 2 (cloud)*")
+                    with st.spinner("Étage 2 — vérification (EfficientNet)..."):
+                        cloud_class, cloud_conf = predict_stage2_image(image)
+
+                    st.success(
+                        f"**Étage 2 (EfficientNet)** : **{cloud_class.upper()}** "
+                        f"(confiance : {cloud_conf:.0%})"
+                    )
+                    final_class = cloud_class
+
+                    if final_class == "polype":
+                        with st.spinner("Étage 2b — classification du type de polype..."):
+                            polyp_type, type_conf = predict_stage3_type(image)
+                        st.success(
+                            f"**Étage 2b (type)** : **{TYPE_LABELS[polyp_type]}** "
+                            f"(confiance : {type_conf:.0%})"
+                        )
 
         st.divider()
         color = {"normal": "🟢", "polype": "🟠", "mici": "🟠",
@@ -907,6 +1149,20 @@ if input_type == " Image":
             """,
             unsafe_allow_html=True,
         )
+
+        if polyp_type is not None:
+            st.markdown(
+                f"""
+                <div class="result-card result-danger" style="margin-top:10px;">
+                    <div class="result-icon">🔬</div>
+                    <div>
+                        <div class="result-label">Type de polype</div>
+                        <div class="result-value">{TYPE_LABELS[polyp_type]}</div>
+                    </div>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
 
     else:
         st.info("👆 Dépose une image ci-dessus pour lancer l'analyse.")
@@ -988,11 +1244,15 @@ elif input_type == " Vidéo":
                 )
 
                 for i, seg in enumerate(segments, 1):
+                    type_suffix = (
+                        f" | type : {TYPE_LABELS[seg['polyp_type']]}"
+                        if seg.get("polyp_type") else ""
+                    )
                     with st.expander(
                         f"**Segment {i}** — "
                         f"{seg['start_ts']} → {seg['end_ts']} "
                         f"| durée : {seg['duration_s']:.1f}s "
-                        f"| confiance : {seg['max_conf']:.0%}",
+                        f"| confiance : {seg['max_conf']:.0%}{type_suffix}",
                         expanded=(i == 1)
                     ):
                         col_info, col_frame = st.columns([1, 2])
@@ -1004,6 +1264,11 @@ elif input_type == " Vidéo":
                             st.markdown(f"**Frame clé :** #{seg['best_frame_idx']}")
                             st.markdown(f"**Confiance max :** {seg['max_conf']:.0%}")
                             st.markdown(f"**Frames détectées :** {seg['n_frames']}")
+                            if seg.get("polyp_type"):
+                                st.markdown(
+                                    f"**Type de polype :** {TYPE_LABELS[seg['polyp_type']]} "
+                                    f"({seg['type_conf']:.0%})"
+                                )
 
                         with col_frame:
                             frame = get_frame_at(tmp_path, seg["best_frame_idx"])
@@ -1020,56 +1285,26 @@ elif input_type == " Vidéo":
                                     img_with_boxes,
                                     caption=f"Frame #{seg['best_frame_idx']} "
                                             f"à {seg['start_ts']}",
-                                    use_column_width=True
+                                    width="stretch"
                                 )
 
-                # --- Graphique timeline ---
+                # --- Graphique interactif ---
                 st.divider()
-                st.markdown("### 📊 Graphique de présence du polype")
+                st.markdown("### 📊 Timeline interactive — cliquez sur un instant pour voir le segment")
 
                 timestamps = [r["timestamp_s"] for r in rows]
                 conf_values = [r["max_conf"] for r in rows]
                 detected_flags = [r["detected"] for r in rows]
 
-                fig, (ax1, ax2) = plt.subplots(
-                    2, 1, figsize=(12, 5),
-                    gridspec_kw={"height_ratios": [3, 1]}
+                selected_seg = render_interactive_timeline(
+                    timestamps, conf_values, detected_flags, segments,
+                    chart_key="video_timeline",
+                    title=f"Timeline — {uploaded_video.name}",
                 )
-
-                ax1.plot(timestamps, conf_values, color=COLOR_TEAL,
-                         linewidth=1.1, alpha=0.85, label="Confiance YOLO")
-                ax1.axhline(YOLO_LOW, color=COLOR_WARNING, linestyle="--",
-                            linewidth=1, label=f"Seuil ({YOLO_LOW})")
-                ax1.fill_between(
-                    timestamps, conf_values,
-                    where=detected_flags,
-                    alpha=0.28, color=COLOR_DANGER, label="Détection active"
-                )
-                ax1.grid(True, axis="y", alpha=0.4)
-                ax1.spines[["top", "right"]].set_visible(False)
-                ax1.set_ylabel("Confiance")
-                ax1.set_ylim(0, 1.05)
-                ax1.legend(fontsize=9)
-                ax1.set_title(f"Timeline — {uploaded_video.name}")
-
-                for seg in segments:
-                    ax2.barh(0, seg["duration_s"], left=seg["start_s"],
-                             height=0.6, color=COLOR_DANGER, alpha=0.85)
-                    ax2.text(
-                        seg["start_s"] + seg["duration_s"] / 2, 0,
-                        seg["start_ts"],
-                        ha="center", va="center",
-                        fontsize=7, color="white", fontweight="bold"
-                    )
-
-                ax2.set_xlim(0, duration_s)
-                ax2.spines[["top", "right", "left"]].set_visible(False)
-                ax2.set_xlabel("Temps (secondes)")
-                ax2.set_yticks([])
-                ax2.set_ylabel("Polypes")
-
-                plt.tight_layout()
-                st.pyplot(fig)
+                if selected_seg:
+                    def _get_frame_for_video(idx):
+                        return get_frame_at(tmp_path, idx)
+                    render_selected_segment(selected_seg, get_frame_fn=_get_frame_for_video)
 
             else:
                 st.info(
@@ -1085,7 +1320,8 @@ elif input_type == " Vidéo":
             if not seg_df.empty:
                 csv_segments = seg_df[
                     ["start_ts", "end_ts", "duration_s",
-                     "best_frame_idx", "max_conf", "n_frames"]
+                     "best_frame_idx", "max_conf", "n_frames",
+                     "polyp_type", "type_conf"]
                 ].to_csv(index=False)
 
                 st.download_button(
@@ -1117,6 +1353,10 @@ elif input_type == " Webcam (live)":
         "Analyser 1 frame sur N", min_value=1, max_value=10, value=3,
         help="Réduit la charge CPU. Valeur 3 = environ 10 analyses/sec sur 30fps."
     )
+    gap_threshold_webcam = st.slider(
+        "Tolérance de coupure entre 2 détections (secondes)", 1, 10, 2,
+        help="Deux détections du même type séparées de moins que ça sont fusionnées en un seul segment."
+    )
     run = st.checkbox("▶️ Démarrer le flux", key="run_webcam")
 
     col_live, col_hist = st.columns([2, 1])
@@ -1124,9 +1364,53 @@ elif input_type == " Webcam (live)":
     status_placeholder = col_live.empty()
     hist_placeholder   = col_hist.empty()
 
-    # Historique des détections dans la session
-    if "webcam_detections" not in st.session_state:
-        st.session_state.webcam_detections = []
+    # État de session : historique brut (pour le graphique) + segments groupés par type
+    if "webcam_rows" not in st.session_state:
+        st.session_state.webcam_rows = []          # [{"t": float, "conf": float}, ...]
+    if "webcam_segments" not in st.session_state:
+        st.session_state.webcam_segments = []       # segments groupés par type
+    if "webcam_seg_start" not in st.session_state:
+        st.session_state.webcam_seg_start = None
+    if "webcam_seg_end" not in st.session_state:
+        st.session_state.webcam_seg_end = None
+    if "webcam_seg_conf" not in st.session_state:
+        st.session_state.webcam_seg_conf = 0.0
+    if "webcam_seg_type" not in st.session_state:
+        st.session_state.webcam_seg_type = None
+    if "webcam_seg_type_conf" not in st.session_state:
+        st.session_state.webcam_seg_type_conf = 0.0
+    if "webcam_seg_frame" not in st.session_state:
+        st.session_state.webcam_seg_frame = None
+    if "webcam_seg_boxes" not in st.session_state:
+        st.session_state.webcam_seg_boxes = []
+    if "webcam_seg_n" not in st.session_state:
+        st.session_state.webcam_seg_n = 0
+
+    def close_webcam_segment():
+        if st.session_state.webcam_seg_start is None:
+            return
+        seg_start = st.session_state.webcam_seg_start
+        seg_end   = st.session_state.webcam_seg_end
+        st.session_state.webcam_segments.append({
+            "start_s": seg_start, "start_ts": fmt_time(seg_start),
+            "end_s": seg_end, "end_ts": fmt_time(seg_end),
+            "duration_s": round(seg_end - seg_start, 2),
+            "max_conf": round(st.session_state.webcam_seg_conf, 4),
+            "best_frame_bgr": st.session_state.webcam_seg_frame,
+            "best_boxes": st.session_state.webcam_seg_boxes,
+            "n_frames": st.session_state.webcam_seg_n,
+            "polyp_type": st.session_state.webcam_seg_type,
+            "type_conf": round(st.session_state.webcam_seg_type_conf, 4)
+                          if st.session_state.webcam_seg_type else None,
+        })
+        st.session_state.webcam_seg_start = None
+        st.session_state.webcam_seg_end   = None
+        st.session_state.webcam_seg_conf  = 0.0
+        st.session_state.webcam_seg_type  = None
+        st.session_state.webcam_seg_type_conf = 0.0
+        st.session_state.webcam_seg_frame = None
+        st.session_state.webcam_seg_boxes = []
+        st.session_state.webcam_seg_n = 0
 
     if run:
         cap = cv2.VideoCapture(int(camera_index))
@@ -1147,26 +1431,43 @@ elif input_type == " Webcam (live)":
 
                 if frame_idx % frame_skip_webcam == 0:
                     detected, boxes, stage = analyze_frame(frame)
+                    max_conf = max(b[4] for b in boxes) if boxes else 0.0
+                    st.session_state.webcam_rows.append({"t": round(elapsed, 2), "conf": round(max_conf, 4)})
+
+                    polyp_type, type_conf = (None, None)
+                    label = "normal"
 
                     if detected:
+                        pil_frame = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+
+                        if stage == 'yolo_only':
+                            # > seuil haut : classification directe du type, pas de vérification
+                            label = "polype"
+                            polyp_type, type_conf = predict_stage3_type(pil_frame)
+                            status_placeholder.success(
+                                f"**Étage 1 (YOLO)** : confiance élevée — classification directe  \n"
+                                f"**Type :** {TYPE_LABELS[polyp_type]} ({type_conf:.0%})"
+                            )
+                        else:
+                            # 50%-90% : EfficientNet vérifie AVANT tout affichage
+                            label, conf = predict_stage2_image(pil_frame)
+                            if label == "polype":
+                                polyp_type, type_conf = predict_stage3_type(pil_frame)
+                                status_placeholder.success(
+                                    f"**Étage 2 :** `{label.upper()}` — confiance : {conf:.0%}  \n"
+                                    f"**Type :** {TYPE_LABELS[polyp_type]} ({type_conf:.0%})"
+                                )
+                            else:
+                                status_placeholder.success(
+                                    f"**Étage 2 :** `{label.upper()}` — confiance : {conf:.0%}"
+                                )
+
                         img_with_boxes = draw_boxes(frame, boxes)
                         frame_placeholder.image(
                             img_with_boxes,
                             caption=f"⏱ {ts} — Frame #{frame_idx} — anomalie détectée",
-                            use_column_width=True,
+                            width="stretch",
                         )
-                        pil_frame = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
-                        label, conf = predict_stage2_image(pil_frame)
-                        status_placeholder.success(
-                            f"**Étage 2 :** `{label.upper()}` — confiance : {conf:.0%}"
-                        )
-                        # Ajouter à l'historique
-                        st.session_state.webcam_detections.append({
-                            "timestamp": ts,
-                            "frame": frame_idx,
-                            "classe": label,
-                            "confiance": f"{conf:.0%}",
-                        })
                     else:
                         frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                         frame_placeholder.image(
@@ -1175,21 +1476,78 @@ elif input_type == " Webcam (live)":
                         )
                         status_placeholder.info("Aucune anomalie détectée.")
 
-                    # Mise à jour historique en temps réel
-                    if st.session_state.webcam_detections:
+                    # --- Groupby : fusionne les détections consécutives du même type ---
+                    is_polyp_now = (label == "polype")
+                    if is_polyp_now:
+                        same_type = (st.session_state.webcam_seg_type == polyp_type)
+                        gap_ok = (
+                            st.session_state.webcam_seg_end is not None and
+                            elapsed - st.session_state.webcam_seg_end <= gap_threshold_webcam
+                        )
+                        if st.session_state.webcam_seg_start is not None and same_type and gap_ok:
+                            # Continuation du même segment/type
+                            st.session_state.webcam_seg_end = elapsed
+                            st.session_state.webcam_seg_n += 1
+                            if max_conf > st.session_state.webcam_seg_conf:
+                                st.session_state.webcam_seg_conf  = max_conf
+                                st.session_state.webcam_seg_frame = frame.copy()
+                                st.session_state.webcam_seg_boxes = boxes
+                                st.session_state.webcam_seg_type_conf = type_conf or 0.0
+                        else:
+                            # Type différent, trou trop grand, ou premier détecté → fermer l'ancien puis ouvrir
+                            close_webcam_segment()
+                            st.session_state.webcam_seg_start = elapsed
+                            st.session_state.webcam_seg_end   = elapsed
+                            st.session_state.webcam_seg_conf  = max_conf
+                            st.session_state.webcam_seg_frame = frame.copy()
+                            st.session_state.webcam_seg_boxes = boxes
+                            st.session_state.webcam_seg_type  = polyp_type
+                            st.session_state.webcam_seg_type_conf = type_conf or 0.0
+                            st.session_state.webcam_seg_n = 1
+                    else:
+                        close_webcam_segment()
+
+                    # Mise à jour historique en temps réel (segments groupés, pas frame par frame)
+                    if st.session_state.webcam_segments:
                         import pandas as pd
-                        df_hist = pd.DataFrame(st.session_state.webcam_detections[-10:])
-                        hist_placeholder.markdown("**🔴 Détections récentes**")
+                        df_hist = pd.DataFrame([
+                            {
+                                "début": s["start_ts"], "fin": s["end_ts"],
+                                "type": TYPE_LABELS.get(s["polyp_type"], "—"),
+                                "confiance": f"{s['max_conf']:.0%}",
+                            }
+                            for s in st.session_state.webcam_segments[-10:]
+                        ])
+                        hist_placeholder.markdown("**🔴 Segments détectés (récents)**")
                         hist_placeholder.dataframe(df_hist, hide_index=True, use_container_width=True)
 
                 frame_idx += 1
 
+            close_webcam_segment()
             cap.release()
 
-    # Export CSV historique
-    if st.session_state.get("webcam_detections"):
+    # --- Graphique interactif + segment sélectionné au clic ---
+    if st.session_state.get("webcam_rows"):
+        st.divider()
+        st.markdown("### 📈 Timeline interactive — cliquez sur un instant pour voir le segment")
+        timestamps = [r["t"] for r in st.session_state.webcam_rows]
+        conf_values = [r["conf"] for r in st.session_state.webcam_rows]
+        selected_seg = render_interactive_timeline(
+            timestamps, conf_values, None,
+            st.session_state.webcam_segments, chart_key="webcam_timeline",
+            title="Confiance de détection — session webcam",
+        )
+        if selected_seg:
+            render_selected_segment(selected_seg)
+
+    # Export CSV historique (segments groupés par type — pas frame par frame)
+    if st.session_state.get("webcam_segments"):
         import pandas as pd
-        csv = pd.DataFrame(st.session_state.webcam_detections).to_csv(index=False)
+        seg_export = [
+            {k: v for k, v in s.items() if k not in ("best_frame_bgr", "best_boxes")}
+            for s in st.session_state.webcam_segments
+        ]
+        csv = pd.DataFrame(seg_export).to_csv(index=False)
         st.download_button(
             "⬇️ Télécharger le rapport de session (CSV)",
             data=csv,
@@ -1197,7 +1555,8 @@ elif input_type == " Webcam (live)":
             mime="text/csv"
         )
         if st.button("🗑️ Effacer l'historique"):
-            st.session_state.webcam_detections = []
+            st.session_state.webcam_rows = []
+            st.session_state.webcam_segments = []
             st.rerun()
 
     if DEMO_MODE:
@@ -1252,6 +1611,10 @@ elif input_type == "🔗 Flux réseau (URL)":
         st.session_state.rtsp_seg_boxes    = []
     if "rtsp_seg_n"        not in st.session_state:
         st.session_state.rtsp_seg_n        = 0
+    if "rtsp_seg_type"      not in st.session_state:
+        st.session_state.rtsp_seg_type      = None
+    if "rtsp_seg_type_conf" not in st.session_state:
+        st.session_state.rtsp_seg_type_conf = 0.0
     if "rtsp_start_time"   not in st.session_state:
         st.session_state.rtsp_start_time   = None
 
@@ -1297,6 +1660,9 @@ elif input_type == "🔗 Flux réseau (URL)":
             "best_frame_bgr": st.session_state.rtsp_seg_frame,
             "best_boxes":     st.session_state.rtsp_seg_boxes,
             "n_frames":       st.session_state.rtsp_seg_n,
+            "polyp_type":     st.session_state.rtsp_seg_type,
+            "type_conf":      round(st.session_state.rtsp_seg_type_conf, 4)
+                               if st.session_state.rtsp_seg_type else None,
         }
         st.session_state.rtsp_segments.append(seg)
 
@@ -1304,11 +1670,15 @@ elif input_type == "🔗 Flux réseau (URL)":
         with segments_ph:
             idx = len(st.session_state.rtsp_segments)
             with st.container(border=True):
+                type_suffix = (
+                    f" — **{TYPE_LABELS[seg['polyp_type']]}**"
+                    if seg["polyp_type"] else ""
+                )
                 st.markdown(
                     f"#### 🔴 Segment {idx} — "
                     f"{seg['start_ts']} → {seg['end_ts']} "
                     f"| {seg['duration_s']:.1f}s "
-                    f"| {seg['max_conf']:.0%}"
+                    f"| {seg['max_conf']:.0%}{type_suffix}"
                 )
                 c1, c2 = st.columns([1, 2])
                 with c1:
@@ -1317,6 +1687,11 @@ elif input_type == "🔗 Flux réseau (URL)":
                     st.markdown(f"**Durée :** {seg['duration_s']:.1f}s")
                     st.markdown(f"**Confiance :** {seg['max_conf']:.0%}")
                     st.markdown(f"**Frames :** {seg['n_frames']}")
+                    if seg["polyp_type"]:
+                        st.markdown(
+                            f"**Type de polype :** {TYPE_LABELS[seg['polyp_type']]} "
+                            f"({seg['type_conf']:.0%})"
+                        )
                 with c2:
                     if seg["best_frame_bgr"] is not None:
                         img_boxes = draw_boxes(seg["best_frame_bgr"], seg["best_boxes"])
@@ -1324,7 +1699,7 @@ elif input_type == "🔗 Flux réseau (URL)":
                         st.image(
                             img_boxes,
                             caption=f"Frame clé à {start_ts}",
-                            use_column_width=True
+                            width="stretch"
                         )
 
         # Réinitialiser le segment courant
@@ -1334,51 +1709,54 @@ elif input_type == "🔗 Flux réseau (URL)":
         st.session_state.rtsp_seg_frame = None
         st.session_state.rtsp_seg_boxes = []
         st.session_state.rtsp_seg_n     = 0
+        st.session_state.rtsp_seg_type      = None
+        st.session_state.rtsp_seg_type_conf = 0.0
 
     # ---------------------------------------------------------------
-    def update_timeline():
-        """Met à jour le graphique timeline avec les données actuelles."""
+    def update_timeline(interactive=False):
+        """Met à jour le graphique timeline. En mode live (interactive=False),
+        pas de clé de widget (évite les collisions de clé dans la boucle).
+        En mode post-session (interactive=True), graphique cliquable."""
         rows = st.session_state.rtsp_rows
         segs = st.session_state.rtsp_segments
         if not rows:
-            return
+            return None
 
         timestamps  = [r["timestamp_s"] for r in rows]
         conf_values = [r["max_conf"]     for r in rows]
         detected    = [r["detected"]     for r in rows]
-        duration_s  = rows[-1]["timestamp_s"] if rows else 1
 
-        fig, (ax1, ax2) = plt.subplots(
-            2, 1, figsize=(12, 4),
-            gridspec_kw={"height_ratios": [3, 1]}
-        )
-        ax1.plot(timestamps, conf_values, color=COLOR_TEAL,
-                 linewidth=1.0, alpha=0.85, label="Confiance YOLO")
-        ax1.axhline(YOLO_LOW, color=COLOR_WARNING, linestyle="--",
-                    linewidth=1, label=f"Seuil ({YOLO_LOW})")
-        ax1.fill_between(timestamps, conf_values,
-                         where=detected, alpha=0.28, color=COLOR_DANGER,
-                         label="Détection active")
-        ax1.grid(True, axis="y", alpha=0.4)
-        ax1.spines[["top", "right"]].set_visible(False)
-        ax1.set_ylabel("Confiance")
-        ax1.set_ylim(0, 1.05)
-        ax1.legend(fontsize=8)
-        ax1.set_title("Timeline flux endoscopique en direct")
-
-        for seg in segs:
-            ax2.barh(0, seg["duration_s"], left=seg["start_s"],
-                     height=0.6, color=COLOR_DANGER, alpha=0.85)
-
-        ax2.set_xlim(0, max(duration_s, 1))
-        ax2.spines[["top", "right", "left"]].set_visible(False)
-        ax2.set_xlabel("Temps (secondes)")
-        ax2.set_yticks([])
-        ax2.set_ylabel("Polypes")
-
-        plt.tight_layout()
-        timeline_ph.pyplot(fig)
-        plt.close(fig)
+        if not interactive:
+            fig = go.Figure()
+            fig.add_trace(go.Scatter(
+                x=timestamps, y=conf_values, mode="lines",
+                line=dict(color=COLOR_TEAL, width=1.2),
+            ))
+            for seg in segs:
+                fig.add_vrect(
+                    x0=seg["start_s"], x1=max(seg["end_s"], seg["start_s"] + 0.15),
+                    fillcolor=COLOR_DANGER, opacity=0.18, line_width=0,
+                )
+            fig.update_layout(
+                height=280, margin=dict(l=10, r=10, t=20, b=10),
+                plot_bgcolor=COLOR_SURFACE, paper_bgcolor=COLOR_SURFACE,
+                font=dict(color=COLOR_INK, family="IBM Plex Sans"),
+                xaxis_title="Temps (s)", yaxis_title="Confiance",
+                yaxis_range=[0, 1.05],
+            )
+            timeline_ph.plotly_chart(fig, use_container_width=True)
+            return None
+        else:
+            with timeline_ph.container():
+                st.markdown("### 📊 Timeline interactive — cliquez sur un instant pour voir le segment")
+                selected = render_interactive_timeline(
+                    timestamps, conf_values, detected, segs,
+                    chart_key="rtsp_timeline_final",
+                    title="Timeline flux endoscopique",
+                )
+                if selected:
+                    render_selected_segment(selected)
+            return None
 
     # ---------------------------------------------------------------
     if run_url:
@@ -1425,16 +1803,38 @@ elif input_type == "🔗 Flux réseau (URL)":
                         detected, boxes, stage = analyze_frame(frame)
                         max_conf = max(b[4] for b in boxes) if boxes else 0.0
 
+                        polyp_type, type_conf = (None, None)
+                        if detected:
+                            pil_frame = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+                            if stage == 'uncertain_sent_to_eff':
+                                # 50%–90% : EfficientNet vérifie avant de classifier le type
+                                eff_class, eff_conf = predict_stage2_image(pil_frame)
+                                if eff_class != 'polype':
+                                    detected = False
+                                    boxes = []
+                                else:
+                                    polyp_type, type_conf = predict_stage3_type(pil_frame)
+                            else:
+                                # > 90% : YOLO déjà confiant → classification directe du type
+                                polyp_type, type_conf = predict_stage3_type(pil_frame)
+
                         # Enregistrer la frame
                         st.session_state.rtsp_rows.append({
                             "timestamp_s": round(elapsed, 2),
                             "timestamp":   ts,
                             "detected":    detected,
                             "max_conf":    round(max_conf, 4),
+                            "polyp_type":  polyp_type,
+                            "type_conf":   round(type_conf, 4) if type_conf else None,
                         })
 
                         # Gestion du segment en cours
                         if detected:
+                            same_type_rtsp = (st.session_state.rtsp_seg_type == polyp_type)
+                            gap_ok_rtsp = (
+                                st.session_state.rtsp_seg_start is not None and
+                                elapsed - st.session_state.rtsp_seg_end <= gap_threshold
+                            )
                             if st.session_state.rtsp_seg_start is None:
                                 # Nouveau segment
                                 st.session_state.rtsp_seg_start = elapsed
@@ -1443,16 +1843,20 @@ elif input_type == "🔗 Flux réseau (URL)":
                                 st.session_state.rtsp_seg_frame = frame.copy()
                                 st.session_state.rtsp_seg_boxes = boxes
                                 st.session_state.rtsp_seg_n     = 1
-                            elif elapsed - st.session_state.rtsp_seg_end <= gap_threshold:
-                                # Continuation
+                                st.session_state.rtsp_seg_type      = polyp_type
+                                st.session_state.rtsp_seg_type_conf = type_conf or 0.0
+                            elif same_type_rtsp and gap_ok_rtsp:
+                                # Continuation (même type, écart acceptable)
                                 st.session_state.rtsp_seg_end = elapsed
                                 st.session_state.rtsp_seg_n  += 1
                                 if max_conf > st.session_state.rtsp_seg_conf:
                                     st.session_state.rtsp_seg_conf  = max_conf
                                     st.session_state.rtsp_seg_frame = frame.copy()
                                     st.session_state.rtsp_seg_boxes = boxes
+                                    st.session_state.rtsp_seg_type      = polyp_type
+                                    st.session_state.rtsp_seg_type_conf = type_conf or 0.0
                             else:
-                                # Gap trop grand → fermer et démarrer nouveau
+                                # Type différent OU gap trop grand → fermer et démarrer nouveau
                                 close_rtsp_segment()
                                 st.session_state.rtsp_seg_start = elapsed
                                 st.session_state.rtsp_seg_end   = elapsed
@@ -1460,6 +1864,8 @@ elif input_type == "🔗 Flux réseau (URL)":
                                 st.session_state.rtsp_seg_frame = frame.copy()
                                 st.session_state.rtsp_seg_boxes = boxes
                                 st.session_state.rtsp_seg_n     = 1
+                                st.session_state.rtsp_seg_type      = polyp_type
+                                st.session_state.rtsp_seg_type_conf = type_conf or 0.0
                         else:
                             # Pas de détection : fermer le segment si gap suffisant
                             if (st.session_state.rtsp_seg_start is not None and
@@ -1469,15 +1875,21 @@ elif input_type == "🔗 Flux réseau (URL)":
                         # Affichage live
                         if detected:
                             img_boxes = draw_boxes(frame, boxes)
+                            type_caption = (
+                                f" — {TYPE_LABELS[polyp_type]}" if polyp_type else ""
+                            )
                             live_frame_ph.image(
                                 img_boxes,
-                                caption=f"⏱ {ts} — Frame #{frame_idx} — 🔴 anomalie",
-                                use_column_width=True
+                                caption=f"⏱ {ts} — Frame #{frame_idx} — 🔴 anomalie{type_caption}",
+                                width="stretch"
                             )
-                            live_status_ph.success(
+                            status_msg = (
                                 f"⏱ {ts} | Frame #{frame_idx} — "
                                 f"confiance YOLO : {max_conf:.0%}"
                             )
+                            if polyp_type:
+                                status_msg += f"  \n**Type :** {TYPE_LABELS[polyp_type]} ({type_conf:.0%})"
+                            live_status_ph.success(status_msg)
                         else:
                             frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                             live_frame_ph.image(
@@ -1496,7 +1908,11 @@ elif input_type == "🔗 Flux réseau (URL)":
 
             # Fermer le dernier segment ouvert à l'arrêt
             close_rtsp_segment()
-            update_timeline()
+            update_timeline(interactive=True)
+    elif st.session_state.get("rtsp_rows"):
+        # Le flux n'est pas en cours, mais une session précédente a des données
+        # (ex: après avoir décoché la case) → afficher quand même le graphique cliquable.
+        update_timeline(interactive=True)
 
     # --- Export CSV final ---
     if st.session_state.rtsp_segments:
@@ -1520,7 +1936,8 @@ elif input_type == "🔗 Flux réseau (URL)":
         if col_dl2.button("🗑️ Nouvelle session"):
             for key in ["rtsp_rows", "rtsp_segments", "rtsp_seg_start",
                         "rtsp_seg_end", "rtsp_seg_conf", "rtsp_seg_frame",
-                        "rtsp_seg_boxes", "rtsp_seg_n", "rtsp_start_time"]:
+                        "rtsp_seg_boxes", "rtsp_seg_n", "rtsp_start_time",
+                        "rtsp_seg_type", "rtsp_seg_type_conf"]:
                 st.session_state[key] = None if "start" in key or "frame" in key \
                     or "end" in key else [] if key in ["rtsp_rows", "rtsp_segments",
                     "rtsp_seg_boxes"] else 0.0 if "conf" in key else 0
