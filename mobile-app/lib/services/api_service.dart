@@ -164,6 +164,26 @@ class ApiService {
 
     return VideoResult.fromJson(jsonDecode(response.body));
   }
+
+  /// Analyse un flux RTSP/HTTP distant.
+  Future<VideoResult> predictStream(String url, {int duration = 30}) async {
+    final uri = Uri.parse('$baseUrl/predict/stream');
+    final response = await http.post(
+      uri,
+      headers: {'Content-Type': 'application/json'},
+      body: jsonEncode({
+        'url': url,
+        'duration_seconds': duration,
+        'frame_skip': 5,
+      }),
+    );
+
+    if (response.statusCode != 200) {
+      throw ApiException('Analyse du flux impossible (${response.statusCode}).');
+    }
+
+    return VideoResult.fromJson(jsonDecode(response.body));
+  }
 }
 
 class ApiException implements Exception {

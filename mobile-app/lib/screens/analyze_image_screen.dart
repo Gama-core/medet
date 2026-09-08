@@ -67,30 +67,25 @@ class _AnalyzeImageScreenState extends State<AnalyzeImageScreen> {
       final picked = await _picker.pickVideo(source: source);
       if (picked == null) return;
 
-      setState(() {
-        _loading = true;
-        _loadingMessage = 'Téléchargement et analyse de la vidéo...';
-        _error = null;
-      });
-
       final videoFile = File(picked.path);
-      final result = await widget.apiService.predictVideo(videoFile);
+      
+      // On prépare l'appel API mais on n'attend pas ici !
+      final analysisFuture = widget.apiService.predictVideo(videoFile);
       
       if (!mounted) return;
-      
+
+      // On navigue IMMÉDIATEMENT vers l'écran de résultats
       Navigator.push(
         context,
-        MaterialPageRoute(builder: (_) => VideoResultScreen(result: result)),
+        MaterialPageRoute(
+          builder: (_) => VideoResultScreen(
+            resultFuture: analysisFuture, 
+            videoPath: videoFile.path,
+          ),
+        ),
       );
     } catch (e) {
-      setState(() => _error = e.toString());
-    } finally {
-      if (mounted) {
-        setState(() {
-          _loading = false;
-          _loadingMessage = null;
-        });
-      }
+      setState(() => _error = "Erreur lors de la sélection de la vidéo.");
     }
   }
 
@@ -190,7 +185,7 @@ class _AnalyzeImageScreenState extends State<AnalyzeImageScreen> {
         decoration: BoxDecoration(
           color: Colors.white,
           borderRadius: BorderRadius.circular(12),
-          border: Border.all(color: AppColors.primaryBlue.withOpacity(0.3)),
+          border: Border.all(color: AppColors.primaryBlue.withValues(alpha: 0.3)),
         ),
         child: Column(
           children: [
@@ -287,11 +282,81 @@ class _AnalyzeImageScreenState extends State<AnalyzeImageScreen> {
                 icon: Icons.video_library_outlined,
                 label: 'Vidéo',
               ),
+              _PickerButton(
+                onPressed: _showStreamDialog,
+                icon: Icons.podcasts_outlined,
+                label: 'Flux Live',
+              ),
             ],
           ),
         ],
       ),
     );
+  }
+
+  void _showStreamDialog() {
+    final controller = TextEditingController(text: 'http://10.0.2.2:8000/predict/stream');
+    showDialog(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('Analyse de Flux Live'),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            const Text('Entrez l\'URL du flux RTSP ou HTTP :', style: TextStyle(fontSize: 13)),
+            const SizedBox(height: 12),
+            TextField(
+              controller: controller,
+              decoration: const InputDecoration(
+                border: OutlineInputBorder(),
+                hintText: 'rtsp://...',
+              ),
+            ),
+          ],
+        ),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(context), child: const Text('Annuler')),
+          ElevatedButton(
+            onPressed: () {
+              Navigator.pop(context);
+              _startStreamAnalysis(controller.text);
+            },
+            child: const Text('Lancer'),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Future<void> _startStreamAnalysis(String url) async {
+    setState(() {
+      _loading = true;
+      _loadingMessage = 'Connexion au flux et analyse en cours...';
+      _error = null;
+    });
+
+    try {
+      final analysisFuture = widget.apiService.predictStream(url);
+      if (!mounted) return;
+      Navigator.push(
+        context,
+        MaterialPageRoute(
+          builder: (_) => VideoResultScreen(
+            resultFuture: analysisFuture,
+            videoPath: url,
+          ),
+        ),
+      );
+    } catch (e) {
+      setState(() => _error = "Échec de l'analyse du flux : $e");
+    } finally {
+      if (mounted) {
+        setState(() {
+          _loading = false;
+          _loadingMessage = null;
+        });
+      }
+    }
   }
 
   Widget _buildPreview() {

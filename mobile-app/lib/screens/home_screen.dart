@@ -173,7 +173,7 @@ class _MenuCard extends StatelessWidget {
           color: color,
           borderRadius: BorderRadius.circular(20),
           boxShadow: [
-            BoxShadow(color: color.withOpacity(0.3), blurRadius: 8, offset: const Offset(0, 4))
+            BoxShadow(color: color.withValues(alpha: 0.3), blurRadius: 8, offset: const Offset(0, 4))
           ],
         ),
         child: Column(
